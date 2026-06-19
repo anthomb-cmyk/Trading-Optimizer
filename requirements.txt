@@ -46,3 +46,9 @@ pytz>=2024.1
 
 # Supabase
 supabase>=2.0
+
+# LLM sentiment scoring (OPTIONAL — only needed when ANTHROPIC_API_KEY is set
+# to score headlines with Claude Haiku; without it the scorer returns None and
+# the pipeline falls back to free GDELT tone). Install manually if desired:
+#   pip install "anthropic>=0.40"
+# anthropic>=0.40

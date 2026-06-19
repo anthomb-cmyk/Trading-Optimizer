@@ -23,6 +23,7 @@ from strategies.opening_range_breakout  import OpeningRangeBreakout          # o
 from strategies.vwap_reversion          import VWAPReversion                 # vwap_reversion
 from strategies.gap_fade                import GapFade                       # gap_fade
 from strategies.short_term_reversal     import ShortTermReversal             # short_term_reversal
+from strategies.sentiment_momentum      import SentimentMomentum              # sentiment_momentum
 
 ALL_STRATEGIES = [
     LiquiditySweepReversal,    # 1
@@ -39,6 +40,7 @@ ALL_STRATEGIES = [
     VWAPReversion,              # vwap_reversion
     GapFade,                    # gap_fade
     ShortTermReversal,          # short_term_reversal
+    SentimentMomentum,          # sentiment_momentum
 ]
 
 STRATEGY_REGISTRY: dict = {cls.name: cls for cls in ALL_STRATEGIES}
