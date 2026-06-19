@@ -117,4 +117,18 @@ VERDICT: the APEX/ICT system has NO validated edge. The honest engine did its jo
 BUG (guardrails miscalibrated): best_params.json showed deflated_sharpe=1.0 and pbo=0.0, which CONTRADICT the holdout/walk-forward verdict. Cause: DSR computed with the annualized Sharpe x large n_obs (units mismatch -> inflates to 1.0); PBO estimated from tiled trial scores, not a real per-period return matrix. Trustworthy signals are holdout_score + walk_forward.is_robust. Fix DSR/PBO wiring so the guardrails stop giving false confidence.
 
 ## DECISION POINT - Phase 3 fork
-ICT did not survive honest validation (as predicted). Options: (A) pivot the strategy layer to evidence-based edges (ORB+volume, VWAP reversion, overnight gap fade, short-term reversal) behind a VIX/ADX regime filter, with an optional LLM sentiment overlay; (B) keep iterating ICT params/timeframes; (C) pause. Recommend A. Awaiting Anthony's call.
+ICT did not survive honest validation (as predicted). Options: (A) pivot the strategy layer to evidence-based edges (ORB+volume, VWAP reversion, overnight gap fade, short-term reversal) behind a VIX/ADX regime filter, with an optional LLM sentiment overlay; (B) keep iterating ICT params/timeframes; (C) pause. Recommend A. DECISION: Anthony chose A (pivot).
+
+## 2026-06-19 - Phase 3 wave 1 (evidence-based strategies + guardrail fix) - built via Ultracode workflow
+- 4 new CAUSAL strategies: `opening_range_breakout`, `vwap_reversion`, `gap_fade`, `short_term_reversal`; + `strategies/regime.py` (ADX + ATR-percentile regime filter, no external VIX needed). Each has a no-repaint causality test; all registered in STRATEGY_REGISTRY.
+- Guardrail fix: DSR/PBO wiring corrected in metrics/optimizer (DSR no longer saturates to 1.0; PBO from a real OOS matrix). New guardrail test in test_validation.
+- Data cache fix verified (refetches when window not covered); CME-aware gaps: 52 real data holes in 4mo (Databento-flagged), 34 session breaks excluded.
+- 11 test suites pass.
+
+Honest in-sample screen (120d MES, unoptimized defaults, realistic costs):
+- opening_range_breakout: PF 1.11, Sharpe 0.38, +$1,556, 60 trades, DD 7% (marginal positive - best candidate)
+- vwap_reversion: PF 0.74 (-$3,715) | gap_fade: PF 0.83 (-$7,424) | short_term_reversal: PF 0.64 (-$10,951) - all losing on defaults.
+Honest reality: even documented edges lose on defaults with real costs. ORB is the only pulse.
+
+### Next: Phase 3 wave 2
+The existing optimizer drives the ICT StrategySystem, not standalone strategies. Build a per-strategy optimizer (single strategy + its get_param_space, reusing the locked holdout + walk-forward + compute_score_v2 + fixed DSR/PBO + Supabase logging), then run it sequentially (8GB M1) on the 4 new strategies to get honest validated verdicts. Apply the regime filter to any survivor.

@@ -34,7 +34,14 @@ import pandas as pd
 
 # ── Import the modules under test ─────────────────────────────────────────────
 
-from backtesting.metrics import deflated_sharpe_ratio, compute_score_v2
+from backtesting.metrics import (
+    deflated_sharpe_ratio,
+    compute_score_v2,
+    sharpe_ratio,
+    per_observation_sharpe_ratio,
+    probability_backtest_overfitting,
+    pbo_from_oos_matrix,
+)
 from backtesting.walk_forward import (
     make_wf_splits_purge_embargo,
     make_combinatorial_splits,
@@ -421,6 +428,134 @@ def test_noise_honesty_gate():
     print(f"[PASS] test_noise_honesty_gate -- holdout DSR={ho_dsr:.4f} < 0.5")
 
 
+# ── T4.2 Guardrail calibration: DSR units + genuine PBO matrix ────────────────
+
+def test_dsr_units_no_edge_below_half():
+    """
+    Guardrail miscalibration regression (DSR units mismatch).
+
+    A zero/no-edge in-sample equity curve selected as the best of many trials
+    must yield a DSR well below 0.5 when DSR is wired the CORRECT way:
+    a PER-OBSERVATION (non-annualized) Sharpe together with n_obs = number of
+    those return observations.
+
+    The bug was feeding the ANNUALIZED Sharpe (which already embeds a
+    sqrt(periods_per_year) factor) together with a large n_obs.  DSR then
+    multiplies by sqrt(n_obs - 1) a SECOND time, the z-score explodes, and
+    Phi(...) saturates to ~1.0 even on a no-edge run -- false confidence.
+
+    This test reproduces the saturation with the buggy wiring and asserts the
+    corrected wiring is sane.
+    """
+    rng = np.random.default_rng(123)
+    A   = 100_000.0
+    n_bars = 5_000
+    # Near-zero per-bar mean: an overfit "best" config with no real edge.
+    r  = rng.normal(0.00008, 0.01, n_bars)
+    eq = pd.concat(
+        [pd.Series([A]), pd.Series(A * np.cumprod(1.0 + r))],
+        ignore_index=True,
+    )
+
+    n_trials = n_bars  # large search, as in a real optimizer run
+
+    # ── BUGGY wiring: annualized Sharpe + len(equity) as n_obs ───────────────
+    sr_annualized = sharpe_ratio(eq)              # embeds sqrt(252*26)
+    dsr_buggy = deflated_sharpe_ratio(
+        observed_sr=sr_annualized,
+        n_trials=n_trials,
+        n_obs=len(eq),
+    )
+
+    # ── CORRECT wiring: per-observation Sharpe + matched n_obs ───────────────
+    sr_per_obs, n_obs = per_observation_sharpe_ratio(eq)
+    dsr_fixed = deflated_sharpe_ratio(
+        observed_sr=sr_per_obs,
+        n_trials=n_trials,
+        n_obs=n_obs,
+    )
+
+    # The buggy wiring saturates to ~1.0 (the false-confidence symptom).
+    assert dsr_buggy > 0.99, (
+        f"Expected the buggy annualized-SR wiring to saturate near 1.0 to "
+        f"demonstrate the bug; got {dsr_buggy:.4f}"
+    )
+    # The fixed wiring must NOT give false confidence on a no-edge run.
+    assert dsr_fixed < 0.5, (
+        f"Wired DSR (per-observation Sharpe) on a no-edge run must be < 0.5; "
+        f"got {dsr_fixed:.4f} (buggy was {dsr_buggy:.4f})"
+    )
+
+    print(
+        f"[PASS] test_dsr_units_no_edge_below_half -- "
+        f"buggy(annualized)={dsr_buggy:.4f}, fixed(per-obs)={dsr_fixed:.4f} "
+        f"(SR_ann={sr_annualized:.3f}, SR_per_obs={sr_per_obs:.4f}, n_obs={n_obs})"
+    )
+
+
+def test_pbo_tiled_scores_is_false_confidence():
+    """
+    Guardrail miscalibration regression (PBO from tiled trial scores).
+
+    The bug built the PBO matrix by tiling one summary score per trial across
+    fake time blocks (np.tile).  Every row is then identical, so the IS-best is
+    mechanically the OOS-best and PBO collapses to 0.0 by construction -- a
+    false "no overfitting" signal regardless of the truth.
+
+    The fix (pbo_from_oos_matrix) must REFUSE such a degenerate / tiled matrix
+    and return None (undefined) instead of 0.0.
+    """
+    rng = np.random.default_rng(0)
+    trial_scores = rng.uniform(0.3, 0.9, 50)
+
+    # Reproduce the old tiling: one summary score per config repeated across
+    # every time block -> a (T, N) matrix where every time-row is identical.
+    S = 8
+    perf_tiled = np.tile(trial_scores, (S, 1))   # (T=S, N=50): all rows identical
+
+    # Old behaviour: a falsely-confident 0.0.
+    pbo_old = probability_backtest_overfitting(perf_tiled, S=S)
+    assert pbo_old == 0.0, (
+        f"Expected the tiled-score matrix to yield the false 0.0; got {pbo_old}"
+    )
+
+    # New behaviour: a tiled / constant-in-time matrix is rejected as undefined.
+    pbo_new = pbo_from_oos_matrix(perf_tiled, S=S)
+    assert pbo_new is None, (
+        f"pbo_from_oos_matrix must return None (undefined) for a tiled matrix, "
+        f"not a false-confidence number; got {pbo_new}"
+    )
+
+    print(
+        f"[PASS] test_pbo_tiled_scores_is_false_confidence -- "
+        f"old tiled PBO={pbo_old} (false), new PBO={pbo_new} (undefined)"
+    )
+
+
+def test_pbo_genuine_oos_matrix_no_edge_is_high():
+    """
+    On a GENUINE per-period OOS matrix built from pure noise (no config has a
+    real edge), PBO must be high (>= 0.5), i.e. honest about overfitting --
+    NOT the false 0.0 produced by the tiled approach.
+    """
+    rng = np.random.default_rng(2024)
+    # Rows = OOS observations (folds/bars), cols = configs.  Pure i.i.d. noise:
+    # no config genuinely dominates, so the IS-best is a random OOS performer.
+    T, N = 160, 12
+    perf = rng.standard_normal((T, N))
+
+    pbo = pbo_from_oos_matrix(perf, S=8)
+    assert pbo is not None, "Genuine noise matrix should yield a defined PBO"
+    assert pbo >= 0.5, (
+        f"PBO on a genuine no-edge OOS matrix should be high (>= 0.5), not the "
+        f"false-confidence 0.0; got {pbo:.4f}"
+    )
+
+    print(
+        f"[PASS] test_pbo_genuine_oos_matrix_no_edge_is_high -- PBO={pbo:.4f}"
+    )
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -443,6 +578,11 @@ if __name__ == "__main__":
 
     print("\n-- T5.2 Noise honesty gate --")
     test_noise_honesty_gate()
+
+    print("\n-- T4.2 Guardrail calibration (DSR units + genuine PBO) --")
+    test_dsr_units_no_edge_below_half()
+    test_pbo_tiled_scores_is_false_confidence()
+    test_pbo_genuine_oos_matrix_no_edge_is_high()
 
     elapsed = time.time() - t0
     print("\n" + "=" * 60)

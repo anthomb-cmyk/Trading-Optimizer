@@ -18,6 +18,12 @@ from strategies.ote_fibonacci           import OTEFibonacciEntry             # S
 from strategies.asian_session           import AsianSessionRangeBreakout     # S9  confirmation
 from strategies.daily_bias_intraday     import DailyBiasIntraday             # S10 bias_filter
 
+# Additional intraday strategies
+from strategies.opening_range_breakout  import OpeningRangeBreakout          # opening_range_breakout
+from strategies.vwap_reversion          import VWAPReversion                 # vwap_reversion
+from strategies.gap_fade                import GapFade                       # gap_fade
+from strategies.short_term_reversal     import ShortTermReversal             # short_term_reversal
+
 ALL_STRATEGIES = [
     LiquiditySweepReversal,    # 1
     OrderBlockReversal,         # 2
@@ -29,6 +35,10 @@ ALL_STRATEGIES = [
     OTEFibonacciEntry,          # 8
     AsianSessionRangeBreakout,  # 9
     DailyBiasIntraday,          # 10
+    OpeningRangeBreakout,       # opening_range_breakout
+    VWAPReversion,              # vwap_reversion
+    GapFade,                    # gap_fade
+    ShortTermReversal,          # short_term_reversal
 ]
 
 STRATEGY_REGISTRY: dict = {cls.name: cls for cls in ALL_STRATEGIES}

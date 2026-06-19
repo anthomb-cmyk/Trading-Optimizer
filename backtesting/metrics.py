@@ -211,6 +211,42 @@ def sharpe_ratio(equity_curve: pd.Series, periods_per_year: int = 252 * 26) -> f
     return float((returns.mean() / returns.std()) * np.sqrt(periods_per_year))
 
 
+def per_observation_sharpe_ratio(equity_curve: pd.Series) -> Tuple[float, int]:
+    """
+    Per-observation (NON-annualized) Sharpe ratio and its observation count.
+
+    Returns ``(sr_per_obs, n_obs)`` where:
+
+    * ``sr_per_obs = mean(per-bar returns) / std(per-bar returns)`` -- the raw
+      per-period Sharpe with **no** ``sqrt(periods_per_year)`` annualization
+      factor, and
+    * ``n_obs`` is the number of return observations the ratio was computed
+      from (``len(returns)``).
+
+    Why this exists (DSR units contract)
+    ------------------------------------
+    The Deflated Sharpe Ratio multiplies ``observed_sr`` by ``sqrt(n_obs - 1)``
+    internally.  Feeding it an *annualized* Sharpe (which already embeds a
+    ``sqrt(periods_per_year)`` factor) together with a large ``n_obs`` double-
+    counts the time scaling and makes ``Phi(...)`` saturate to ~1.0 even for a
+    zero-edge strategy -- a false-confidence guardrail failure.  DSR must be fed
+    a Sharpe and ``n_obs`` on the *same per-period basis*; this helper returns
+    exactly that matched pair.
+
+    Uses ``_clean_equity_curve`` so the same sign contract as ``sharpe_ratio``
+    holds (net-losing curve => sr_per_obs <= 0).
+    """
+    if len(equity_curve) < 2:
+        return 0.0, 2
+
+    eq = _clean_equity_curve(equity_curve)
+    returns = eq.pct_change().dropna()
+    n_obs = int(len(returns))
+    if returns.std() == 0 or n_obs < 2:
+        return 0.0, max(2, n_obs)
+    return float(returns.mean() / returns.std()), n_obs
+
+
 def calmar_ratio(equity_curve: pd.Series) -> float:
     """
     Total return / max drawdown (same sign contract as Sharpe).
@@ -403,6 +439,72 @@ def probability_backtest_overfitting(
 
     pbo = float(np.mean(np.array(logit_vals) <= 0.0))
     return float(np.clip(pbo, 0.0, 1.0))
+
+
+def pbo_from_oos_matrix(
+    perf_matrix: Optional[np.ndarray],
+    S: int = 16,
+    min_configs: int = 4,
+    min_rows: int = 4,
+) -> Optional[float]:
+    """
+    PBO wrapper that requires a GENUINE per-period OOS performance matrix.
+
+    Unlike calling :func:`probability_backtest_overfitting` directly, this
+    helper refuses to fabricate a result from degenerate input.  It returns
+    ``None`` (clearly-marked "undefined") rather than a misleading ``0.0`` when:
+
+    * ``perf_matrix`` is ``None`` or not 2-D, or
+    * there are fewer than ``min_configs`` configs (columns), or
+    * there are fewer than ``min_rows`` per-period observations (rows), or
+    * every row is identical (a tiled / constant matrix carries no genuine
+      out-of-sample dispersion, so the IS-best is mechanically the OOS-best and
+      PBO would collapse to 0.0 by construction -- the original miscalibration).
+
+    Parameters
+    ----------
+    perf_matrix : ndarray of shape (T_observations, N_configs) or None.
+                  Each cell is the *out-of-sample* per-period performance of
+                  config n at observation t (per-fold or per-bar OOS score).
+    S           : Number of CSCV blocks (passed through; auto-reduced to an even
+                  value <= number of rows).
+    min_configs : Minimum number of configs required to report a number.
+    min_rows    : Minimum number of per-period observations required.
+
+    Returns
+    -------
+    float in [0, 1], or ``None`` when the matrix is too small / degenerate to
+    yield a genuine estimate.
+    """
+    if perf_matrix is None:
+        return None
+
+    pm = np.asarray(perf_matrix, dtype=float)
+    if pm.ndim != 2:
+        return None
+
+    T, N = pm.shape
+    if N < min_configs or T < min_rows:
+        return None
+
+    # Reject a tiled / constant-in-time matrix: no genuine OOS dispersion.
+    if np.allclose(pm, pm[0:1, :]):
+        return None
+
+    # Force S even and no larger than the number of rows (need >= 1 row/block).
+    S = max(2, int(S))
+    if S % 2 != 0:
+        S -= 1
+    S = min(S, T)
+    if S % 2 != 0:
+        S -= 1
+    if S < 2:
+        return None
+
+    try:
+        return probability_backtest_overfitting(pm, S=S)
+    except (ValueError, ZeroDivisionError):
+        return None
 
 
 def minimum_track_record_length(

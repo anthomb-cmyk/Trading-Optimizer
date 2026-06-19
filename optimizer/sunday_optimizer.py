@@ -38,7 +38,8 @@ from backtesting.engine import BacktestEngine
 from backtesting.metrics import (
     compute_score_v2,
     deflated_sharpe_ratio,
-    probability_backtest_overfitting,
+    pbo_from_oos_matrix,
+    per_observation_sharpe_ratio,
     sharpe_ratio,
 )
 from backtesting.walk_forward import WalkForwardAnalyzer, recommended_max_trials
@@ -352,41 +353,47 @@ class SundayOptimizer:
         log.info("Train backtest: %s", full_result.summary())
 
         # ── T4.3: Deflated Sharpe (DSR) using effective trials ────────────────
-        sr_obs = sharpe_ratio(full_result.equity_curve)
-        n_obs  = max(2, len(full_result.equity_curve))
-        dsr    = deflated_sharpe_ratio(
-            observed_sr = sr_obs,
+        # DSR units contract: deflated_sharpe_ratio multiplies observed_sr by
+        # sqrt(n_obs - 1) internally, so it must be fed a PER-OBSERVATION (non-
+        # annualized) Sharpe together with the number of those return
+        # observations.  Feeding the ANNUALIZED Sharpe (which already embeds a
+        # sqrt(periods_per_year) factor) with a large n_obs double-counts the
+        # time scaling and saturates Phi(...) to ~1.0 even on a zero-edge run --
+        # the false-confidence guardrail bug.  The annualized Sharpe is still
+        # logged for human reading.
+        sr_per_obs, n_obs = per_observation_sharpe_ratio(full_result.equity_curve)
+        sr_annualized     = sharpe_ratio(full_result.equity_curve)
+        dsr               = deflated_sharpe_ratio(
+            observed_sr = sr_per_obs,
             n_trials    = effective_trials,
             n_obs       = n_obs,
         )
         log.info(
-            "Deflated Sharpe: %.4f (SR=%.4f, n_trials=%d, n_obs=%d)",
-            dsr, sr_obs, effective_trials, n_obs,
+            "Deflated Sharpe: %.4f (SR_per_obs=%.4f, SR_annualized=%.4f, "
+            "n_trials=%d, n_obs=%d)",
+            dsr, sr_per_obs, sr_annualized, effective_trials, n_obs,
         )
 
-        # ── T4.3: PBO via per-trial OOS performance matrix ────────────────────
-        # Build a performance matrix from completed trials: each trial's
-        # objective value is treated as its OOS performance across S blocks.
-        # When only a single OOS score per trial is available we approximate
-        # by duplicating across S columns (worst-case PBO estimate).
-        trial_scores = [t.value for t in completed if t.value is not None]
-        pbo = 0.0
-        if len(trial_scores) >= 4:
-            try:
-                S = min(16, max(2, int(len(trial_scores) ** 0.5)))
-                if S % 2 != 0:
-                    S -= 1
-                S = max(2, S)
-                n_configs = max(2, min(len(trial_scores), 200))
-                # Sample n_configs evenly from all completed trials
-                idx     = np.round(np.linspace(0, len(trial_scores) - 1, n_configs)).astype(int)
-                scores  = np.array(trial_scores)[idx]
-                # Replicate scores across S rows to form (S, n_configs) perf matrix
-                perf_matrix = np.tile(scores, (S, 1))
-                pbo = probability_backtest_overfitting(perf_matrix.T, S=S)
-            except Exception as exc:
-                log.debug("PBO computation failed: %s", exc)
-        log.info("Probability of Backtest Overfitting (PBO): %.4f", pbo)
+        # ── T4.3: PBO via a GENUINE per-period OOS performance matrix ──────────
+        # A real CSCV/PBO needs a (T_observations x N_configs) matrix of
+        # per-period OUT-OF-SAMPLE scores, NOT a single summary score per trial
+        # tiled across fake time blocks.  Tiling makes every row identical, so
+        # the IS-best is mechanically the OOS-best and PBO collapses to 0.0 by
+        # construction -- a false-confidence guardrail bug.
+        #
+        # Here we replay walk-forward on the top completed trials and stack each
+        # trial's PER-FOLD OOS scores as one column.  Rows = WF folds (genuine
+        # OOS observations), columns = configs.  If too few trials produce
+        # enough comparable OOS folds, PBO is reported as None (undefined)
+        # rather than a misleading 0.0.
+        pbo = self._compute_oos_pbo(completed, best_params)
+        if pbo is None:
+            log.info(
+                "Probability of Backtest Overfitting (PBO): UNDEFINED "
+                "(too few comparable OOS trials to build a genuine matrix)"
+            )
+        else:
+            log.info("Probability of Backtest Overfitting (PBO): %.4f", pbo)
 
         # ── T4.4: Locked holdout evaluation ───────────────────────────────────
         holdout_score = 0.0
@@ -442,7 +449,7 @@ class SundayOptimizer:
             best_score       = float(best.value) if best.value is not None else 0.0,
             best_params      = best_params,
             deflated_sharpe  = float(dsr),
-            pbo              = float(pbo),
+            pbo              = (float(pbo) if pbo is not None else None),
             effective_trials = int(effective_trials),
             oos_score        = float(oos_score),
             holdout_score    = float(holdout_score),
@@ -457,6 +464,76 @@ class SundayOptimizer:
         )
         self._save_study_metrics(study, full_result, wf_result)
 
+    # ── PBO from genuine per-fold OOS matrix ──────────────────────────────────
+
+    def _compute_oos_pbo(
+        self,
+        completed,
+        best_params: Dict[str, Any],
+        *,
+        max_configs: int = 24,
+        min_configs: int = 4,
+    ) -> Optional[float]:
+        """
+        Build a genuine (T_folds x N_configs) per-period OOS performance matrix
+        and compute PBO from it.
+
+        For each of up to ``max_configs`` top completed trials we replay full
+        walk-forward (train data only) and collect the per-fold OOS scores.
+        Trials are kept only if they yield the SAME number of OOS folds as the
+        majority, so every column is aligned to the same time blocks.  Each
+        column is one config; each row is one OOS fold (a real out-of-sample
+        observation).
+
+        Returns a float in [0, 1], or ``None`` when too few comparable trials
+        exist to form a genuine matrix (reported as undefined, never 0.0).
+        """
+        # Rank completed trials by objective value; take the strongest configs.
+        scored = sorted(
+            (t for t in completed if t.value is not None),
+            key=lambda t: t.value,
+            reverse=True,
+        )
+        if len(scored) < min_configs:
+            return None
+        scored = scored[:max_configs]
+
+        wf = WalkForwardAnalyzer(
+            self.objective.engine,
+            n_splits=OPTIMIZER["walk_forward_splits"],
+        )
+
+        columns: list = []   # each entry: list of per-fold OOS scores for a config
+        for t in scored:
+            params = t.user_attrs.get("full_params") or t.params
+            try:
+                res = wf.analyze(
+                    self.objective.df,
+                    self.objective.system.generate_signals,
+                    params,
+                )
+            except Exception as exc:   # noqa: BLE001 - one bad config must not abort PBO
+                log.debug("PBO: WF replay failed for trial #%d: %s", t.number, exc)
+                continue
+            fold_scores = [f.oos_score for f in res.folds]
+            if fold_scores:
+                columns.append(fold_scores)
+
+        if len(columns) < min_configs:
+            return None
+
+        # Align all configs to the most common fold count so the matrix is
+        # rectangular and every row is the same OOS time block across configs.
+        from collections import Counter
+        n_folds = Counter(len(c) for c in columns).most_common(1)[0][0]
+        aligned = [c for c in columns if len(c) == n_folds]
+        if len(aligned) < min_configs:
+            return None
+
+        # perf_matrix: rows = OOS folds (observations), cols = configs.
+        perf_matrix = np.array(aligned, dtype=float).T   # (n_folds, n_configs)
+        return pbo_from_oos_matrix(perf_matrix)
+
     def _save_best_params(
         self,
         params:           Dict[str, Any],
@@ -464,10 +541,10 @@ class SundayOptimizer:
         metrics:          Dict[str, float],
         wf_result,
         *,
-        dsr:              float = 0.0,
-        pbo:              float = 0.0,
-        holdout_score:    float = 0.0,
-        effective_trials: int   = 0,
+        dsr:              float          = 0.0,
+        pbo:              Optional[float] = 0.0,
+        holdout_score:    float          = 0.0,
+        effective_trials: int            = 0,
     ):
         output = {
             "generated_at":     datetime.now(timezone.utc).isoformat(),
@@ -476,7 +553,7 @@ class SundayOptimizer:
             "score":            round(score, 6),
             "holdout_score":    round(holdout_score, 6),
             "deflated_sharpe":  round(dsr, 6),
-            "pbo":              round(pbo, 6),
+            "pbo":              (round(pbo, 6) if pbo is not None else None),
             "effective_trials": int(effective_trials),
             "walk_forward":  {
                 "is_robust":       wf_result.is_robust,
