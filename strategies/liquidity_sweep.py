@@ -73,8 +73,8 @@ class LiquiditySweepReversal(BaseStrategy):
         atr      = df["atr"].ffill()
 
         # ── Step 1: Find equal highs and equal lows ──────────────────────────
-        eq_highs = self._equal_levels(df["high"], df["swing_high"], lb, eq_pct)
-        eq_lows  = self._equal_levels(df["low"],  df["swing_low"],  lb, eq_pct)
+        eq_highs = self._equal_levels(df["swing_high_price"], df["swing_high"], lb, eq_pct)
+        eq_lows  = self._equal_levels(df["swing_low_price"],  df["swing_low"],  lb, eq_pct)
 
         # ── Step 2: Detect sweeps ────────────────────────────────────────────
         # Bullish sweep: wick below equal lows, close back above

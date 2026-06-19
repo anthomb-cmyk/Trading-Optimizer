@@ -85,8 +85,8 @@ class OTEFibonacciEntry(BaseStrategy):
         # ── Step 1: Identify qualifying swings ────────────────────────────────
         # A qualifying bullish swing: swing low followed by swing high with
         # sufficient range AND a BOS (close above swing high confirms the move).
-        swing_high_price = df["high"].where(df["swing_high"]).ffill()
-        swing_low_price  = df["low"].where(df["swing_low"]).ffill()
+        swing_high_price = df["swing_high_price"].ffill()
+        swing_low_price  = df["swing_low_price"].ffill()
 
         # Minimum swing size
         swing_up_size   = swing_high_price - swing_low_price.shift(lb)

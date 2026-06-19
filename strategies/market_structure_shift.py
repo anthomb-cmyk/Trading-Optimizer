@@ -82,8 +82,8 @@ class MarketStructureShiftEntry(BaseStrategy):
 
         # Require CHoCH move is substantial (not just noise)
         min_move = atr * p["choch_min_atr_mult"]
-        last_sh   = df["high"].where(df["swing_high"]).ffill()
-        last_sl   = df["low"].where(df["swing_low"]).ffill()
+        last_sh   = df["swing_high_price"].ffill()
+        last_sl   = df["swing_low_price"].ffill()
         bull_choch = bull_choch & ((df["close"] - last_sh.shift(1)) >= min_move)
         bear_choch = bear_choch & ((last_sl.shift(1) - df["close"]) >= min_move)
 

@@ -257,8 +257,8 @@ class BaseStrategy(ABC):
         Bullish CHoCH: in a downtrend, closes above the last swing high.
         Bearish CHoCH: in an uptrend, closes below the last swing low.
         """
-        last_sh = df["high"].where(df["swing_high"]).ffill()
-        last_sl = df["low"].where(df["swing_low"]).ffill()
+        last_sh = df["swing_high_price"].ffill()
+        last_sl = df["swing_low_price"].ffill()
 
         bull_choch = (
             (df["close"] > last_sh.shift(1)) &

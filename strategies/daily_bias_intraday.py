@@ -180,10 +180,10 @@ class DailyBiasIntraday(BaseStrategy):
 
         # Source 3: Swing structure — last swing high and swing low direction
         lb             = p["structure_lookback"]
-        last_sh        = df["high"].where(df["swing_high"]).ffill()
-        last_sl        = df["low"].where(df["swing_low"]).ffill()
-        prev_sh        = df["high"].where(df["swing_high"]).shift(lb).ffill()
-        prev_sl        = df["low"].where(df["swing_low"]).shift(lb).ffill()
+        last_sh        = df["swing_high_price"].ffill()
+        last_sl        = df["swing_low_price"].ffill()
+        prev_sh        = df["swing_high_price"].shift(lb).ffill()
+        prev_sl        = df["swing_low_price"].shift(lb).ffill()
 
         hh = last_sh > prev_sh   # higher high
         hl = last_sl > prev_sl   # higher low

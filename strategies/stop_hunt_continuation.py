@@ -79,13 +79,13 @@ class StopHuntContinuation(BaseStrategy):
         lb  = p["trend_lookback"]
 
         # ── Step 1: Trend identification via swing structure ──────────────────
-        swing_high_price = df["high"].where(df["swing_high"]).ffill()
-        swing_low_price  = df["low"].where(df["swing_low"]).ffill()
+        swing_high_price = df["swing_high_price"].ffill()
+        swing_low_price  = df["swing_low_price"].ffill()
 
         # Bullish trend: current swing high > previous swing high AND
         #                current swing low  > previous swing low
-        prev_sh = df["high"].where(df["swing_high"]).shift(1).ffill()
-        prev_sl = df["low"].where(df["swing_low"]).shift(1).ffill()
+        prev_sh = df["swing_high_price"].shift(1).ffill()
+        prev_sl = df["swing_low_price"].shift(1).ffill()
 
         bull_trend = (swing_high_price > prev_sh) & (swing_low_price > prev_sl)
         bear_trend = (swing_high_price < prev_sh) & (swing_low_price < prev_sl)

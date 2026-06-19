@@ -21,6 +21,7 @@ from ta.momentum  import RSIIndicator
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+from data.swings import _swing_highs, _swing_lows
 from config.logger import get_logger
 from config.settings import (
     CACHE_EXPIRY_HOURS,
@@ -214,6 +215,12 @@ def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["swing_high"] = _swing_highs(df["high"].values, lb)
     df["swing_low"]  = _swing_lows(df["low"].values, lb)
 
+    # Causal pivot PRICE carried to the confirmation bar. The flag sits at i+lb
+    # while the pivot is at i, so high/low.shift(lb) recovers the pivot price with
+    # no look-ahead. NaN except at confirmed-swing bars; consumers .ffill().
+    df["swing_high_price"] = df["high"].shift(lb).where(df["swing_high"])
+    df["swing_low_price"]  = df["low"].shift(lb).where(df["swing_low"])
+
     # Body size
     df["body"]  = (df["close"] - df["open"]).abs()
     df["range"] = df["high"] - df["low"]
@@ -226,26 +233,9 @@ def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _swing_highs(highs: np.ndarray, lookback: int) -> np.ndarray:
-    n      = len(highs)
-    result = np.zeros(n, dtype=bool)
-    lb     = lookback
-    for i in range(lb, n - lb):
-        window = highs[i - lb : i + lb + 1]
-        if highs[i] == window.max():
-            result[i] = True
-    return result
-
-
-def _swing_lows(lows: np.ndarray, lookback: int) -> np.ndarray:
-    n      = len(lows)
-    result = np.zeros(n, dtype=bool)
-    lb     = lookback
-    for i in range(lb, n - lb):
-        window = lows[i - lb : i + lb + 1]
-        if lows[i] == window.min():
-            result[i] = True
-    return result
+# _swing_highs and _swing_lows are defined in data/swings.py (numpy-only,
+# causal confirm-and-shift implementation).  They are imported at the top of
+# this module so the rest of the codebase continues to resolve them from here.
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
