@@ -116,9 +116,86 @@ def _is_stale(path: Path) -> bool:
     return age > CACHE_EXPIRY_HOURS * 3600
 
 
+def _cache_covers(path: Path, requested_start: datetime) -> bool:
+    """
+    Return True if the parquet at *path* covers at least *requested_start*.
+
+    Reads only the index from the parquet (cheap metadata read).  If the
+    parquet's earliest bar is within a 1-day tolerance of *requested_start*
+    the cache is considered sufficient; otherwise a refetch is needed.
+
+    Returns False (needs refetch) if the file does not exist, cannot be read,
+    or starts later than requested_start + 1 day.
+    """
+    if not path.exists():
+        return False
+    try:
+        # Read only the index (avoids loading all columns)
+        pf = pd.read_parquet(path, columns=[])
+        if len(pf) == 0:
+            return False
+        cached_start = pf.index[0]
+        # Normalise timezone: requested_start is UTC-aware
+        if cached_start.tzinfo is None:
+            cached_start = cached_start.tz_localize("UTC")
+        else:
+            cached_start = cached_start.tz_convert("UTC")
+        if requested_start.tzinfo is None:
+            requested_start = requested_start.replace(tzinfo=timezone.utc)
+        # Allow 1-day slop (weekends, holidays near the boundary)
+        tolerance = timedelta(days=1)
+        return cached_start <= requested_start + tolerance
+    except Exception as exc:
+        log.warning("Could not read cache index for coverage check: %s", exc)
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Integrity checks (T3.4)
 # ---------------------------------------------------------------------------
+
+def _is_cme_expected_break(t_prev: pd.Timestamp, t_next: pd.Timestamp) -> bool:
+    """
+    Return True if the gap between *t_prev* and *t_next* is an EXPECTED CME
+    Globex equity-index break (ES / NQ / MES / MNQ) and should NOT be flagged.
+
+    CME Globex session (UTC):
+    - Trading runs Sunday ~23:00 UTC through Friday ~22:00 UTC.
+    - Daily maintenance halt: ~22:00-23:00 UTC every weekday (17:00-18:00 ET).
+    - Weekend closure: Friday ~22:00 UTC through Sunday ~23:00 UTC.
+
+    A gap is "expected" if EITHER end falls outside active-session hours or
+    crosses the Friday-close / Sunday-open boundary.
+    """
+    # Maintenance halt window: 21:55 – 23:05 UTC (5-min slop each side)
+    HALT_START_UTC = 21 + 55 / 60   # 21:55 UTC
+    HALT_END_UTC   = 23 + 5  / 60   # 23:05 UTC
+
+    prev_dow   = t_prev.weekday()   # Mon=0 … Sun=6
+    next_dow   = t_next.weekday()
+    prev_hour  = t_prev.hour + t_prev.minute / 60.0
+    next_hour  = t_next.hour + t_next.minute / 60.0
+
+    # Weekend break: gap starts on Friday eve (≥21:55 UTC) or covers Sat/Sun
+    # and ends on Sunday evening (≥22:55 UTC) or Monday morning
+    if prev_dow == 4 and prev_hour >= HALT_START_UTC:  # Friday after halt start
+        return True
+    if prev_dow == 5 or prev_dow == 6:  # gap starts on Saturday or Sunday
+        return True
+    if next_dow == 6:  # gap ends on Sunday (before open)
+        return True
+    if next_dow == 0 and next_hour < HALT_END_UTC:  # early Sunday/Monday before open
+        return True
+
+    # Daily maintenance halt: gap crosses the 22:00-23:00 UTC window on any weekday
+    if prev_hour >= HALT_START_UTC and next_hour <= HALT_END_UTC:
+        return True
+    # Gap that starts just before the halt and ends just after (same calendar day)
+    if prev_hour >= HALT_START_UTC and next_hour <= HALT_END_UTC + 0.5:
+        return True
+
+    return False
+
 
 def _check_integrity(
     df: pd.DataFrame,
@@ -132,15 +209,15 @@ def _check_integrity(
     Checks performed:
     1. Monotonic increasing timestamps (no backward jumps).
     2. Unexpected weekend bars (Saturday/Sunday UTC).
-    3. Gap detection: counts bars that are missing vs the expected
-       trading schedule.  For intraday bars we use a rough expected
-       frequency and flag any gap larger than twice the bar period.
+    3. Gap detection: counts bars that are GENUINELY missing within an active
+       CME Globex session.  Expected breaks (Friday close -> Sunday open,
+       daily ~22:00-23:00 UTC maintenance halt) are NOT counted.
     4. Timezone correctness: index must be UTC-aware.
 
     Returns
     -------
     int
-        Number of gaps / integrity issues found.
+        Number of genuine integrity issues found (expected breaks excluded).
     """
     issues = 0
 
@@ -166,37 +243,60 @@ def _check_integrity(
         )
         issues += 1
 
-    # -- Weekend bars (CME Globex has no bars Sat/Sun)
+    # -- Weekend bars check
+    # On CME Globex, Sunday bars CAN exist (session opens ~23:00 UTC Sunday).
+    # True unexpected bars are on Saturday (dayofweek==5) or early Sunday
+    # before the ~23:00 open. We only flag Saturday bars to avoid false positives.
     if len(df) > 0:
-        weekend_mask = df.index.dayofweek >= 5  # 5=Sat, 6=Sun
-        n_weekend = int(weekend_mask.sum())
-        if n_weekend > 0:
+        saturday_mask = df.index.dayofweek == 5  # 5=Saturday
+        n_saturday = int(saturday_mask.sum())
+        if n_saturday > 0:
             run_logger.log_event(
-                f"[{symbol} {timeframe}] {n_weekend} weekend bars found (unexpected for CME Globex)",
+                f"[{symbol} {timeframe}] {n_saturday} Saturday bars found (unexpected for CME Globex)",
                 run_uuid=run_uuid, level="WARN", kind="data",
-                payload={"n_weekend_bars": n_weekend},
+                payload={"n_saturday_bars": n_saturday},
             )
-            issues += n_weekend
+            issues += n_saturday
 
-    # -- Gap detection for intraday timeframes
+    # -- Gap detection for intraday timeframes (CME session-aware)
     _tf_minutes = {
         "1m": 1, "3m": 3, "5m": 5, "15m": 15, "1h": 60, "4h": 240,
     }
     if timeframe in _tf_minutes and len(df) > 1:
         bar_mins = _tf_minutes[timeframe]
         expected_delta = pd.Timedelta(minutes=bar_mins)
-        # Gaps bigger than 2x the bar period (excluding weekends/holidays)
-        diffs = df.index.to_series().diff().dropna()
         gap_threshold = expected_delta * 2
-        gaps = diffs[diffs > gap_threshold]
-        n_gaps = len(gaps)
-        if n_gaps > 0:
-            run_logger.log_event(
-                f"[{symbol} {timeframe}] {n_gaps} gaps detected (threshold: {gap_threshold})",
-                run_uuid=run_uuid, level="WARN", kind="data",
-                payload={"n_gaps": n_gaps, "gap_threshold_min": bar_mins * 2},
+
+        idx_series = df.index.to_series()
+        diffs = idx_series.diff().dropna()
+        raw_gaps = diffs[diffs > gap_threshold]
+
+        real_gaps = 0
+        expected_breaks = 0
+        for t_next, delta in raw_gaps.items():
+            # iloc position of t_next in the original index
+            pos = df.index.get_loc(t_next)
+            t_prev = df.index[pos - 1]
+            if _is_cme_expected_break(t_prev, t_next):
+                expected_breaks += 1
+            else:
+                real_gaps += 1
+
+        if expected_breaks > 0:
+            log.debug(
+                "[%s %s] %d expected CME session breaks skipped "
+                "(Friday close, daily halt 22:00-23:00 UTC)",
+                symbol, timeframe, expected_breaks,
             )
-            issues += n_gaps
+        if real_gaps > 0:
+            run_logger.log_event(
+                f"[{symbol} {timeframe}] {real_gaps} REAL intraday gaps detected "
+                f"(threshold: {gap_threshold}; {expected_breaks} expected CME breaks excluded)",
+                run_uuid=run_uuid, level="WARN", kind="data",
+                payload={"n_real_gaps": real_gaps, "n_expected_breaks": expected_breaks,
+                         "gap_threshold_min": bar_mins * 2},
+            )
+            issues += real_gaps
 
     return issues
 
@@ -460,17 +560,27 @@ def fetch_ohlcv(
             f"Known symbols: {sorted(_DB_SYMBOL_MAP)}"
         )
 
+    end_dt = datetime.now(timezone.utc)
+    start_dt = end_dt - timedelta(days=days)
+
     cache_path = _db_cache_path(db_symbol, timeframe)
-    if use_cache and not _is_stale(cache_path):
-        log.debug("Loading %s %s from Databento cache: %s", symbol, timeframe, cache_path.name)
+    if use_cache and not _is_stale(cache_path) and _cache_covers(cache_path, start_dt):
+        log.debug(
+            "Loading %s %s from Databento cache: %s (covers %s)",
+            symbol, timeframe, cache_path.name, start_dt.strftime("%Y-%m-%d"),
+        )
         df = pd.read_parquet(cache_path)
         # Ensure UTC index (parquet may strip tz)
         if df.index.tz is None:
             df.index = df.index.tz_localize("UTC")
-        return df
-
-    end_dt = datetime.now(timezone.utc)
-    start_dt = end_dt - timedelta(days=days)
+        # Slice to the requested window (don't return extra history)
+        mask = df.index >= pd.Timestamp(start_dt)
+        return df[mask]
+    elif use_cache and cache_path.exists() and not _cache_covers(cache_path, start_dt):
+        log.info(
+            "Cache for %s %s does not cover requested start %s — refetching %d days",
+            symbol, timeframe, start_dt.strftime("%Y-%m-%d"), days,
+        )
 
     # -- Decide fetch strategy
     if timeframe in _RESAMPLE_FROM_1M:

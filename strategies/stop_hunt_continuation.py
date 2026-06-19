@@ -56,6 +56,7 @@ class StopHuntContinuation(BaseStrategy):
             "rr_ratio":             2.0,
             "kill_zones":           ["london", "ny_am"],
             "fvg_min_atr_mult":     0.25,
+            "trend_confirm_pct":    0.6,    # fraction of lookback bars that must show trend
         }
 
     def get_param_space(self, trial: Any) -> Dict[str, Any]:
@@ -69,6 +70,7 @@ class StopHuntContinuation(BaseStrategy):
             "atr_sl_mult":         trial.suggest_float("shc_atr_sl_mult",      0.6, 2.0),
             "rr_ratio":            trial.suggest_float("shc_rr_ratio",         1.5, 3.5),
             "fvg_min_atr_mult":    trial.suggest_float("shc_fvg_min_atr",      0.15, 0.6),
+            "trend_confirm_pct":   trial.suggest_float("shc_trend_confirm_pct", 0.4, 0.8),
         }
 
     def generate_signals(self, df: pd.DataFrame, params: Dict[str, Any]) -> pd.DataFrame:
@@ -90,9 +92,9 @@ class StopHuntContinuation(BaseStrategy):
         bull_trend = (swing_high_price > prev_sh) & (swing_low_price > prev_sl)
         bear_trend = (swing_high_price < prev_sh) & (swing_low_price < prev_sl)
 
-        # Rolling trend confirmation over lb bars
-        bull_trend_confirmed = bull_trend.rolling(lb).sum() > (lb * 0.6)
-        bear_trend_confirmed = bear_trend.rolling(lb).sum() > (lb * 0.6)
+        # Rolling trend confirmation over lb bars (threshold is tunable via trend_confirm_pct)
+        bull_trend_confirmed = bull_trend.rolling(lb).sum() > (lb * p["trend_confirm_pct"])
+        bear_trend_confirmed = bear_trend.rolling(lb).sum() > (lb * p["trend_confirm_pct"])
 
         # ── Step 2: Key level identification ─────────────────────────────────
         # Use recent swing lows as support (for bull continuation)

@@ -118,6 +118,12 @@ class FVGRetest(BaseStrategy):
             (df["low"]  <= bear_open_top + tol)
         )
 
+        # Detect the genuine first-touch per zone using _track_first_touch.
+        # This tracks whether the current zone has been entered before; the
+        # first bar where price enters is the only one flagged True.
+        bull_first_touch_raw = self._track_first_touch(in_bull_fvg, bull_top)
+        bear_first_touch_raw = self._track_first_touch(in_bear_fvg, bear_top)
+
         # Entry price depends on mode
         if p["entry_at"] == "edge":
             long_entry_ref  = bull_open_top   # enter at top of bull FVG (50% fill)
@@ -145,9 +151,13 @@ class FVGRetest(BaseStrategy):
             else pd.Series(True, index=df.index)
         )
 
+        bull_first_touch = bull_first_touch_raw
+        bear_first_touch = bear_first_touch_raw
+
+        # ── Step 4 continued: Confluence ──────────────────────────────────────
         long_conf = (
             in_bull_fvg.astype(int) +            # [1] open FVG exists
-            in_bull_fvg.astype(int) +            # [2] price entering from above (same check — deduplicate in production)
+            bull_first_touch.astype(int) +        # [2] first touch of FVG (entering from correct side)
             (bias == 1).astype(int) +            # [3] daily bias bullish
             in_kz.astype(int) +                  # [4] kill zone
             ob_bull_w.astype(int) +              # [5] OB at FVG
@@ -155,15 +165,19 @@ class FVGRetest(BaseStrategy):
         )
         short_conf = (
             in_bear_fvg.astype(int) +
-            in_bear_fvg.astype(int) +
+            bear_first_touch.astype(int) +        # [2] first touch of FVG (entering from correct side)
             (bias == -1).astype(int) +
             in_kz.astype(int) +
             ob_bear_w.astype(int) +
             vol_contract.astype(int)
         )
 
-        long_trigger  = in_bull_fvg & (long_conf  >= self.min_confluence)
-        short_trigger = in_bear_fvg & (short_conf >= self.min_confluence)
+        # Entry: first touch of the FVG zone, inside a kill zone, HTF bias aligned,
+        # with confluence >= threshold.
+        # Kill zone + bias alignment as hard gates mirrors the docstring intent:
+        # [3] FVG aligned with daily bias and [4] kill zone timing are key required filters.
+        long_trigger  = bull_first_touch & in_kz & (bias == 1) & (long_conf  >= self.min_confluence)
+        short_trigger = bear_first_touch & in_kz & (bias == -1) & (short_conf >= self.min_confluence)
 
         out["long_signal"]  = long_trigger
         out["short_signal"] = short_trigger
@@ -192,6 +206,36 @@ class FVGRetest(BaseStrategy):
         return self._finalize_signals(out, self.min_confluence)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _track_first_touch(
+        in_zone: pd.Series,
+        zone_new: pd.Series,
+    ) -> pd.Series:
+        """
+        Return a boolean Series that is True ONLY on the first bar price enters
+        a given FVG zone (ignoring subsequent bars in the same zone).
+
+        `in_zone`  — True when price is touching/inside the tracked zone.
+        `zone_new` — notna() marks bars where a new zone was created (bull_top
+                     or bear_top from _fvg_zones); used to reset the touched flag.
+
+        Algorithm: iterate bar-by-bar, tracking per-zone whether it has been
+        entered before. A new zone (zone_new.notna()) resets the touched flag.
+        """
+        in_z      = in_zone.values.astype(bool)
+        is_new    = zone_new.notna().values
+        n         = len(in_z)
+        result    = np.zeros(n, dtype=bool)
+        touched   = True   # sentinel: no zone yet, so mark as "touched" to suppress
+
+        for i in range(n):
+            if is_new[i]:
+                touched = False  # new zone formed — reset; next entry is first touch
+            if in_z[i] and not touched:
+                result[i] = True
+                touched = True   # only the very first entry bar is flagged
+        return pd.Series(result, index=in_zone.index)
 
     @staticmethod
     def _fvg_zones(

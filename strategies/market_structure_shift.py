@@ -108,13 +108,15 @@ class MarketStructureShiftEntry(BaseStrategy):
         vol   = self.volume_filter(df)
 
         # RSI divergence: price lower low but RSI higher low (bullish div)
+        # Use rsi_divergence_window (default 14), not structure_lookback (50).
+        rsi_win   = p["rsi_divergence_window"]
         rsi_vals  = df.get("rsi", pd.Series(50, index=df.index)).fillna(50)
-        price_new_low  = df["close"] < df["close"].rolling(lb).min().shift(1)
-        rsi_not_low    = rsi_vals > rsi_vals.rolling(lb).min().shift(1)
+        price_new_low  = df["close"] < df["close"].rolling(rsi_win).min().shift(1)
+        rsi_not_low    = rsi_vals > rsi_vals.rolling(rsi_win).min().shift(1)
         bull_div       = price_new_low & rsi_not_low
 
-        price_new_high = df["close"] > df["close"].rolling(lb).max().shift(1)
-        rsi_not_high   = rsi_vals < rsi_vals.rolling(lb).max().shift(1)
+        price_new_high = df["close"] > df["close"].rolling(rsi_win).max().shift(1)
+        rsi_not_high   = rsi_vals < rsi_vals.rolling(rsi_win).max().shift(1)
         bear_div       = price_new_high & rsi_not_high
 
         long_conf = (

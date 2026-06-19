@@ -134,20 +134,97 @@ def confluence_score(trades: pd.DataFrame, max_possible: int = 6) -> float:
     return float(min(avg / max_possible, 1.0))
 
 
+def _clean_equity_curve(equity_curve: pd.Series) -> pd.Series:
+    """
+    Remove stale between-trade bars from a sparse equity curve.
+
+    BacktestEngine initializes ``equity_curve = [account_size] * n_bars`` and
+    only updates bars that fall inside a trade window.  Bars between trades keep
+    the initial account-size value.  This causes phantom returns -- for example,
+    a trade that exits at a realized loss of 9 800 is followed by bars that still
+    show 10 000, making it look like a +2% recovery that never happened.
+
+    Fix: any bar *after* the first equity deviation that still equals the initial
+    value is replaced with NaN, then forward-filled from the last realized equity.
+    Bars before the first trade are untouched (they correctly hold the starting
+    equity and contribute 0% return).
+
+    A dense equity curve (all bars distinct) passes through unchanged because no
+    bar after the first deviation equals the initial value.
+    """
+    eq = equity_curve.astype(float)
+    initial = float(eq.iloc[0])
+
+    deviates = eq != initial
+    if not deviates.any():
+        # Flat curve with no trades -- return as-is; callers will return 0.
+        return eq
+
+    first_dev_pos = int(np.argmax(deviates.values))
+
+    positions = np.arange(len(eq))
+    stale = (positions > first_dev_pos) & (eq.values == initial)
+
+    eq_clean = eq.copy()
+    eq_clean.iloc[stale] = np.nan
+    eq_clean = eq_clean.ffill()
+    return eq_clean
+
+
 def sharpe_ratio(equity_curve: pd.Series, periods_per_year: int = 252 * 26) -> float:
-    """Annualized Sharpe on bar-by-bar returns (0 risk-free rate)."""
-    returns = equity_curve.pct_change().dropna()
+    """
+    Annualized Sharpe ratio on per-bar equity returns (0 risk-free rate).
+
+    Annualization convention
+    ------------------------
+    ``periods_per_year`` defaults to 252 * 26 = 6 552, reflecting intraday
+    15-minute bars with 26 bars per regular trading-hours session and 252
+    trading days per year.  Override for different bar sizes or instruments.
+
+    Sparse equity-curve handling
+    ----------------------------
+    The backtesting engine produces a sparse equity curve: bars between trades
+    keep the initial account-size value instead of being forward-filled with the
+    last realized equity.  Those stale bars create phantom returns (e.g. a
+    realized loss followed by a jump back to the initial value) that corrupt the
+    mean and sign of the naive ``pct_change()`` Sharpe.
+
+    This function calls ``_clean_equity_curve`` to replace stale between-trade
+    bars with the last realized equity before computing returns, so:
+
+    * a net-losing equity curve always yields Sharpe <= 0, and
+    * a net-winning equity curve always yields Sharpe >= 0.
+
+    Sign contract
+    -------------
+    mean(per-bar returns) / std(per-bar returns) * sqrt(periods_per_year).
+    A strategy whose equity ends below its starting value has a negative mean
+    return on the cleaned curve and therefore a negative (or zero) Sharpe.
+    """
+    if len(equity_curve) < 2:
+        return 0.0
+
+    eq = _clean_equity_curve(equity_curve)
+    returns = eq.pct_change().dropna()
     if returns.std() == 0 or len(returns) < 2:
         return 0.0
     return float((returns.mean() / returns.std()) * np.sqrt(periods_per_year))
 
 
 def calmar_ratio(equity_curve: pd.Series) -> float:
-    """Annualized return / max drawdown."""
-    mdd = max_drawdown(equity_curve)
+    """
+    Total return / max drawdown (same sign contract as Sharpe).
+
+    Uses ``_clean_equity_curve`` so that stale between-trade bars do not
+    inflate the final equity to the initial account size and do not create
+    phantom drawdown from post-win flat regions.  A net-losing strategy
+    yields Calmar <= 0; a net-winning strategy yields Calmar >= 0.
+    """
+    eq = _clean_equity_curve(equity_curve)
+    mdd = max_drawdown(eq)
     if mdd == 0:
         return 0.0
-    total_return = (equity_curve.iloc[-1] / equity_curve.iloc[0]) - 1.0
+    total_return = (eq.iloc[-1] / eq.iloc[0]) - 1.0
     return float(total_return / mdd)
 
 
@@ -389,9 +466,10 @@ def compute_score(
     if len(trades) < min_trades:
         return 0.0
 
+    eq_clean = _clean_equity_curve(equity_curve)
     wr   = win_rate(trades)
     pf   = profit_factor(trades, cap=5.0)
-    mdd  = max_drawdown(equity_curve)
+    mdd  = max_drawdown(eq_clean)
     conf = confluence_score(trades)
 
     # Normalize profit factor to [0, 1] (capped at 5)
@@ -491,17 +569,18 @@ def compute_score_v2(
             w = _SCORE_V2_DEFAULT_WEIGHTS
 
     # ── Component metrics ────────────────────────────────────────────────────
+    eq_clean = _clean_equity_curve(equity_curve)
     wr  = win_rate(trades)
     pf  = profit_factor(trades, cap=5.0)
-    mdd = max_drawdown(equity_curve)
+    mdd = max_drawdown(eq_clean)
 
     # Normalise profit_factor to [0, 1] (cap=5)
     pf_norm = float(np.clip(pf / 5.0, 0.0, 1.0))
 
     # Return-over-max-drawdown: total_return / mdd, normalised to [0, 1].
     # Cap at 10x to avoid inf on very low drawdown runs, then scale.
-    if len(equity_curve) >= 2 and equity_curve.iloc[0] > 0:
-        total_return = (equity_curve.iloc[-1] / equity_curve.iloc[0]) - 1.0
+    if len(eq_clean) >= 2 and eq_clean.iloc[0] > 0:
+        total_return = (eq_clean.iloc[-1] / eq_clean.iloc[0]) - 1.0
     else:
         total_return = 0.0
     if mdd > 1e-9:
@@ -559,13 +638,15 @@ def compute_all_metrics(
     wins   = trades.loc[trades["pnl"] > 0, "pnl"]
     losses = trades.loc[trades["pnl"] < 0, "pnl"].abs()
 
+    eq_clean = _clean_equity_curve(equity_curve)
+
     return {
         "total_trades":            int(len(trades)),
         "winning_trades":          int((trades["pnl"] > 0).sum()),
         "losing_trades":           int((trades["pnl"] < 0).sum()),
         "win_rate":                round(win_rate(trades), 4),
         "profit_factor":           round(profit_factor(trades), 4),
-        "max_drawdown":            round(max_drawdown(equity_curve), 4),
+        "max_drawdown":            round(max_drawdown(eq_clean), 4),
         "avg_rr":                  round(average_rr(trades), 4),
         "confluence_score":        round(confluence_score(trades), 4),
         "sharpe":                  round(sharpe_ratio(equity_curve), 4),
@@ -578,5 +659,5 @@ def compute_all_metrics(
         "avg_loss":                round(float(losses.mean()) if len(losses) > 0 else 0.0, 2),
         "avg_trade_duration_bars": round(float(trades["duration_bars"].mean()), 1)
                                    if "duration_bars" in trades.columns else 0.0,
-        "final_equity":            round(float(equity_curve.iloc[-1]), 2),
+        "final_equity":            round(float(eq_clean.iloc[-1]), 2),
     }

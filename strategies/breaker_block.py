@@ -47,6 +47,7 @@ class BreakerBlockReversal(BaseStrategy):
             "rr_ratio":             2.5,
             "kill_zones":           ["london", "ny_am"],
             "fvg_min_atr_mult":     0.3,
+            "break_body_pct":       0.5,    # displacement candle body/range ratio filter
         }
 
     def get_param_space(self, trial: Any) -> Dict[str, Any]:
@@ -59,6 +60,7 @@ class BreakerBlockReversal(BaseStrategy):
             "atr_sl_mult":          trial.suggest_float("bb_atr_sl_mult",        0.6, 2.0),
             "rr_ratio":             trial.suggest_float("bb_rr_ratio",           1.5, 4.0),
             "fvg_min_atr_mult":     trial.suggest_float("bb_fvg_min_atr_mult",   0.2, 0.8),
+            "break_body_pct":       trial.suggest_float("bb_break_body_pct",      0.35, 0.75),
         }
 
     def generate_signals(self, df: pd.DataFrame, params: Dict[str, Any]) -> pd.DataFrame:
@@ -77,8 +79,13 @@ class BreakerBlockReversal(BaseStrategy):
         bear_ob_low  = bear_ob_low_raw.ffill()
 
         # ── Step 2: Detect break-through (displacement) ───────────────────────
-        # Displacement = bar range >= break_atr_mult * ATR
-        displacement = df["range"] >= (atr * p["break_atr_mult"])
+        # Displacement = bar range >= break_atr_mult * ATR AND body/range >= break_body_pct
+        # (prevents a large-range doji from qualifying as displacement)
+        body_ratio   = df["body"] / df["range"].replace(0, np.nan)
+        displacement = (
+            (df["range"] >= (atr * p["break_atr_mult"])) &
+            (body_ratio  >= p["break_body_pct"])
+        )
 
         # Bullish OB broken downward (price closes below OB low with displacement)
         # → becomes a Bearish Breaker Block

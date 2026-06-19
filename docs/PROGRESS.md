@@ -87,3 +87,20 @@ Then: run the optimizer (DSR/PBO/holdout) per strategy on real data -> keep only
 
 ### Open inputs / ops
 - Anthony to confirm account size (placeholder 50k) and that the Supabase migration deployed (Actions) + service_role key is in `.env`.
+
+## 2026-06-19 - Phase 2 wave 1 (engine trustworthiness + strategy bug fixes)
+
+### Trustworthiness fixes - DONE
+- Sharpe/Calmar/maxDD: `metrics` now forward-fills stale between-trade equity bars (`_clean_equity_curve`) before computing returns. Losing strategies correctly show negative Sharpe (was a phantom-return bug: PF 0.65 had shown Sharpe +4.6). `tests/test_metrics.py` = 16.
+- Data cache now honors `days` (refetches when the cache does not cover the requested window); CME-session-aware gap detection (expected weekend/maintenance breaks no longer flagged; ~18 remaining gaps are real Databento data holes, e.g. 2026-02-21/02-28/03-07).
+
+### Strategy logic bugs (Appendix A) - DONE
+- asian_session precedence (now fires), fvg_retest first-touch (no double-count), ote `retracement_min` applied + paired swing, market_structure RSI window 14, stop_hunt `trend_confirm_pct` param, breaker displacement body filter.
+- Residual strategy-quality issues for the next pass: stop_hunt 0 signals (swing-data condition); breaker over-fires (~2946 signals, no first-touch dedup on the retest zone).
+
+### Honest backtest (120d MES, unoptimized defaults, realistic costs, correct Sharpe) - IN-SAMPLE ONLY, NOT VALIDATED
+fvg_retest PF 1.27 (+$12,038) | kill_zone PF 1.70 (+$4,790) | asian_session PF 1.19 (+$1,955) | market_structure ~BE | daily_bias ~BE | order_block PF 0.80 | liquidity_sweep PF 0.18 | breaker_block PF 0.84 | ote_fibonacci PF 0.45.
+Caveats: single in-sample period, no DSR/PBO/holdout; Sharpe magnitudes inflated on sparse trade curves (trust PnL/PF). These are LEADS, not edges.
+
+### Next: Phase 2 wave 2
+Run the optimizer (data-derived trial budget + locked 20% holdout + DSR/PBO, logged to Supabase) on the promising strategies (fvg_retest, kill_zone, asian_session) to see whether any edge survives out-of-sample after overfitting correction.

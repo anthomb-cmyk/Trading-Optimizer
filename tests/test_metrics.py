@@ -28,6 +28,7 @@ from backtesting.metrics import (
     probability_backtest_overfitting,
     minimum_track_record_length,
     compute_score_v2,
+    sharpe_ratio,
 )
 
 SEED = 42
@@ -365,6 +366,122 @@ def test_score_v2_with_deflated_sharpe():
     )
 
 
+# ── Sharpe sign and known-value tests ────────────────────────────────────────
+
+def _make_sparse_equity(account_size: float, n_bars: int, trades_pnl: list) -> pd.Series:
+    """
+    Simulate the BacktestEngine equity curve: all bars start at account_size,
+    only bars inside trade windows (entry_bar..exit_bar) are updated.
+    Bars between trades remain at account_size (the stale-bar pattern that the
+    fix must handle).
+
+    trades_pnl is a list of (start_bar, exit_bar, pnl) tuples.
+    """
+    eq = [float(account_size)] * n_bars
+    cum_pnl = 0.0
+    for start, end, pnl in trades_pnl:
+        n_trade_bars = end - start
+        for b in range(start, end):
+            frac = (b - start) / max(n_trade_bars, 1)
+            eq[b] = account_size + cum_pnl + pnl * frac
+        eq[end] = account_size + cum_pnl + pnl
+        cum_pnl += pnl
+    return pd.Series(eq)
+
+
+def test_sharpe_sign_losing():
+    """
+    A strategy whose trades are all losses must produce Sharpe < 0.
+
+    Uses a sparse equity curve produced by the same pattern as BacktestEngine
+    (between-trade bars hold the initial account_size), which is the exact
+    pattern the fix addresses.  Before the fix, stale between-trade bars
+    created phantom positive returns that flipped the sign.
+    """
+    A = 10_000.0
+    # Three losing trades; bars between trades are stale (hold A=10_000)
+    eq = _make_sparse_equity(A, 500, [
+        (50,  60,  -200.0),   # trade 1: -$200
+        (150, 165, -300.0),   # trade 2: -$300
+        (300, 320, -300.0),   # trade 3: -$300
+    ])
+    sr = sharpe_ratio(eq)
+    assert sr < 0.0, (
+        f"Sharpe must be negative for a net-losing strategy; got {sr:.4f}.\n"
+        f"Equity: start={eq.iloc[0]:.0f}, final(clean)={A - 800:.0f}"
+    )
+    print(f"[PASS] test_sharpe_sign_losing -- Sharpe={sr:.4f}")
+
+
+def test_sharpe_sign_winning():
+    """
+    A strategy whose trades are all wins must produce Sharpe > 0.
+
+    Same sparse-equity-curve pattern as test_sharpe_sign_losing.
+    """
+    A = 10_000.0
+    eq = _make_sparse_equity(A, 500, [
+        (50,  60,  400.0),   # trade 1: +$400
+        (150, 165, 300.0),   # trade 2: +$300
+        (300, 320, 500.0),   # trade 3: +$500
+    ])
+    sr = sharpe_ratio(eq)
+    assert sr > 0.0, (
+        f"Sharpe must be positive for a net-winning strategy; got {sr:.4f}.\n"
+        f"Equity: start={eq.iloc[0]:.0f}, final(clean)={A + 1200:.0f}"
+    )
+    print(f"[PASS] test_sharpe_sign_winning -- Sharpe={sr:.4f}")
+
+
+def test_sharpe_known_value():
+    """
+    Hand-built returns series with known mean and std => Sharpe within tolerance.
+
+    Construction
+    ------------
+    We build a dense (non-sparse) equity curve from 1 000 i.i.d. log-normal
+    daily returns with mean = 0.001 and std = 0.01 (fixed seed 42).
+
+    Annualization convention: periods_per_year = 252 * 26 = 6 552
+    (intraday 15-minute bars, 26 bars per RTH session, 252 trading days/year).
+
+    Hand calculation
+    ----------------
+    hand_SR = mean(r) / std(r) * sqrt(6552)
+            = 0.001 / 0.01 * sqrt(6552)
+            ≈ 0.1 * 80.94
+            ≈ 8.094   (exact value depends on the realized sample moments)
+
+    Tolerance: the pct_change-based computation introduces a small bias
+    relative to the arithmetic-returns hand calc (geometric vs arithmetic
+    returns differ by O(sigma^2/2) ≈ 5e-5 per period); delta < 1.0 suffices.
+    """
+    rng = np.random.default_rng(42)
+    n = 1_000
+    r = rng.normal(0.001, 0.01, n)          # per-period arithmetic returns
+
+    # Build equity curve (dense: no stale bars)
+    A = 10_000.0
+    eq_vals = A * np.cumprod(1.0 + r)
+    eq = pd.concat([pd.Series([A]), pd.Series(eq_vals)], ignore_index=True)
+
+    periods_per_year = 252 * 26
+    hand_sr = float(r.mean() / r.std()) * np.sqrt(periods_per_year)
+    computed_sr = sharpe_ratio(eq, periods_per_year=periods_per_year)
+
+    assert abs(computed_sr - hand_sr) < 1.0, (
+        f"Sharpe mismatch: hand={hand_sr:.4f}, computed={computed_sr:.4f}, "
+        f"delta={abs(computed_sr - hand_sr):.4f} (tolerance 1.0)"
+    )
+    # Sanity: both should be positive (mean return 0.001 > 0)
+    assert computed_sr > 0.0, f"Expected positive Sharpe for positive-mean returns; got {computed_sr:.4f}"
+    print(
+        f"[PASS] test_sharpe_known_value -- "
+        f"hand_SR={hand_sr:.4f}, computed_SR={computed_sr:.4f}, "
+        f"delta={abs(computed_sr - hand_sr):.4f}"
+    )
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -392,6 +509,11 @@ if __name__ == "__main__":
     test_score_v2_output_bounded()
     test_score_v2_below_min_trades()
     test_score_v2_with_deflated_sharpe()
+
+    # Sharpe sign and known-value
+    test_sharpe_sign_losing()
+    test_sharpe_sign_winning()
+    test_sharpe_known_value()
 
     print("=" * 60)
     print("All test_metrics tests PASSED.")

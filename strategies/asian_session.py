@@ -140,7 +140,7 @@ class AsianSessionRangeBreakout(BaseStrategy):
 
         long_conf = (
             range_ok.astype(int) +              # [1] valid range
-            bull_break_recent.astype(int) if mode == "breakout" else long_trigger.astype(int) +
+            (bull_break_recent.astype(int) if mode == "breakout" else long_trigger.astype(int)) +  # [2] break / trigger
             (bias == 1).astype(int) +           # [3] HTF bullish
             in_active.astype(int) +             # [4] in active session
             vol.astype(int) +                   # [5] volume
@@ -148,7 +148,7 @@ class AsianSessionRangeBreakout(BaseStrategy):
         )
         short_conf = (
             range_ok.astype(int) +
-            bear_break_recent.astype(int) if mode == "breakout" else short_trigger.astype(int) +
+            (bear_break_recent.astype(int) if mode == "breakout" else short_trigger.astype(int)) +  # [2] break / trigger
             (bias == -1).astype(int) +
             in_active.astype(int) +
             vol.astype(int) +

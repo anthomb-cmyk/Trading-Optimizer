@@ -88,13 +88,19 @@ class OTEFibonacciEntry(BaseStrategy):
         swing_high_price = df["swing_high_price"].ffill()
         swing_low_price  = df["swing_low_price"].ffill()
 
-        # Minimum swing size
-        swing_up_size   = swing_high_price - swing_low_price.shift(lb)
-        swing_down_size = swing_low_price  - swing_high_price.shift(lb)
+        # Minimum swing size — use the paired prior swing rather than a fixed shift.
+        # For a bullish swing (swing_high above swing_low), pair the current swing_high
+        # with the nearest prior swing_low: take the rolling minimum of swing_low_price
+        # over the lookback window as the swing origin.
+        paired_bull_low  = swing_low_price.rolling(lb, min_periods=1).min()
+        paired_bear_high = swing_high_price.rolling(lb, min_periods=1).max()
+
+        swing_up_size   = swing_high_price - paired_bull_low
+        swing_down_size = paired_bear_high - swing_low_price
 
         min_swing = atr * p["swing_min_atr_mult"]
         valid_bull_swing = swing_up_size   >= min_swing
-        valid_bear_swing = swing_down_size.abs() >= min_swing
+        valid_bear_swing = swing_down_size >= min_swing
 
         # BOS to confirm swing direction
         bull_bos, bear_bos = self.detect_bos(df, lb, confirm_bars=1)
@@ -117,16 +123,27 @@ class OTEFibonacciEntry(BaseStrategy):
         ote_bear_lo = bear_peak  + p["ote_low_fib"]  * bear_size
         ote_bear_hi = bear_peak  + p["ote_high_fib"] * bear_size
 
+        # Retracement gate: price must have pulled back at least retracement_min
+        # of the swing before we treat the OTE band as reachable.
+        # For a bull swing: current low must be <= peak - retracement_min * size
+        bull_retrace_level = bull_peak - p["retracement_min"] * bull_size
+        bear_retrace_level = bear_peak + p["retracement_min"] * bear_size
+
+        sufficient_bull_retrace = df["low"]  <= bull_retrace_level + tol
+        sufficient_bear_retrace = df["high"] >= bear_retrace_level - tol
+
         # Price in OTE band
         in_ote_bull = (
             (df["low"]  <= ote_bull_hi + tol) &
             (df["high"] >= ote_bull_lo - tol) &
-            valid_bull_swing & bull_bos
+            valid_bull_swing & bull_bos &
+            sufficient_bull_retrace          # retracement_min applied
         )
         in_ote_bear = (
             (df["high"] >= ote_bear_lo - tol) &
             (df["low"]  <= ote_bear_hi + tol) &
-            valid_bear_swing & bear_bos
+            valid_bear_swing & bear_bos &
+            sufficient_bear_retrace          # retracement_min applied
         )
 
         # ── Step 3: Reversal trigger at OTE ──────────────────────────────────
