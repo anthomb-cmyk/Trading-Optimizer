@@ -146,5 +146,17 @@ Built `optimizer/strategy_optimizer.py` (per-strategy locked holdout + walk-forw
 VERDICT: NONE survive honest validation. DSR ~0.01 (no edge after deflation), walk-forward 0% fold pass, holdout fails. *vwap/short_term holdout PF look positive but on 3-5 trades = noise. Guardrails confirmed working (DSR ~0.01 on no-edge, not the old false 1.0).
 CAVEAT: the optimizer selected low-trade-frequency configs, so the holdout had only 3-5 trades (under-powered). The decisive signals are the train walk-forward 0% fold-pass + DSR ~0.01. A more rigorous retry would use multi-year data + a minimum-trade-frequency penalty in the objective.
 
+## 2026-06-19 - Phase 3 wave 2b: RIGOROUS re-test verdict (definitive)
+Re-ran the per-strategy honest optimizer on 2.5yr MES (58,415 bars, 183-day POWERED holdout, trade-frequency floor=50/yr, regime gating in the search space, 400 trials each). The penalty worked: configs now trade 41-55/yr and the holdout saw 26-43 trades (vs 3-5 before).
+
+| strat | train OOS | holdout score | DSR | trades/yr | WF pass | holdout PF | holdout Sharpe | holdout trades |
+|---|---|---|---|---|---|---|---|---|
+| opening_range_breakout | 0.502 | 0.045 | 0.134 | 50.4 | 100% | 0.85 | -0.27 | 38 |
+| vwap_reversion | 0.434 | 0.027 | 0.241 | 41.1 | 67% | 0.53 | -0.97 | 26 |
+| gap_fade | 0.452 | 0.326 | 0.211 | 50.0 | 67% | 1.14 | +0.35 | 36 |
+| short_term_reversal | 0.534 | 0.028 | 0.250 | 55.2 | 100% | 0.63 | -0.98 | 43 |
+
+DEFINITIVE VERDICT: no strategy clears a validated edge. All DSR < 0.5 (not distinguishable from luck after 400-trial selection); all is_robust=False. gap_fade is the ONLY one positive on the untouched holdout (PF 1.14, Sharpe +0.35, 36 trades) but DSR=0.21 means NOT statistically significant (likely noise). The other three lose out-of-sample. Even with the fair maximal test (more data + trade-frequency floor + regime gating + walk-forward), textbook price-only edges do not validate on MES 15m. gap_fade is a weak footnote, not a green light.
+
 ## Where this leaves the project
-Two honest negatives now: ICT (no edge) AND four textbook evidence-based edges (no validated edge) on MES 15m, default search. The durable asset delivered is the HONEST ENGINE that reliably separates truth from noise (it correctly fails ICT, fails textbook edges, and finds nothing in random data). Realistic next options (all uncertain): (a) multi-year data + frequency-constrained re-search; (b) LLM news/sentiment overlay (the AI differentiator); (c) regime-filtered ensembles; (d) accept the verdict and stop scaling effort. Decision pending.
+Two honest negatives now: ICT (no edge) AND four textbook evidence-based edges (no validated edge even under the rigorous re-test) on MES 15m. The durable asset delivered is the HONEST ENGINE that reliably separates truth from noise (it correctly fails ICT, fails textbook edges, and finds nothing in random data). Realistic next options (all uncertain): (a) multi-year data + frequency-constrained re-search; (b) LLM news/sentiment overlay (the AI differentiator); (c) regime-filtered ensembles; (d) accept the verdict and stop scaling effort. Decision pending.
