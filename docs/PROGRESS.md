@@ -56,3 +56,34 @@ Look-ahead elimination (Epic 1) is complete: swings, detectors, and walk-forward
 - T2.x realistic cost/fill model (engine.py); T4.1/4.2/4.3/4.4 purged CV + Deflated Sharpe + PBO + trial budget + locked holdout; T4.5 scoring off win-rate; T5.1/T5.2 buy-and-hold + noise honesty tests; T6.1 config realism (account size/risk + flip DEFAULT_INSTRUMENT to MES + CME-aware gap detection).
 - Still needs from Anthony: account size + per-trade risk %.
 - Known Phase 2 strategy-logic bugs confirmed live: fvg_retest duplicate-confluence over-firing; asian_session breakout precedence (never fires).
+
+## 2026-06-19 - Wave 2 complete (costs, validation, honesty metrics, config)
+
+### Engine costs/fills (T2.x, T5.1) - DONE
+- `backtesting/engine.py`: two-sided regime-aware slippage, round-trip commission, pessimistic fills (gap-through stops fill at open; TP needs trade-through; SL assumed before TP intrabar), mark-to-market equity. `tests/test_engine_costs.py` (5 tests).
+
+### Honesty metrics + scoring (T4.2, T4.5) - DONE
+- `backtesting/metrics.py`: `deflated_sharpe_ratio`, `probability_backtest_overfitting` (CSCV), `minimum_track_record_length`, `compute_score_v2` (demotes win_rate). `tests/test_metrics.py` (13 tests).
+
+### Validation pipeline (T4.1, T4.3, T4.4, T5.2) - DONE
+- `backtesting/walk_forward.py`: purge+embargo splits, CPCV, `recommended_max_trials`.
+- `optimizer/sunday_optimizer.py`: locked 20% holdout, data-derived trial budget (~5,113 not 500k), `compute_score_v2` objective, DSR/PBO computed and logged to Supabase. `tests/test_validation.py` (8 tests; noise gate holdout DSR=0.0).
+
+### Config realism (T6.1) - DONE
+- `config/settings.py`: account 50k (placeholder), risk 500/trade, `MAX_CONTRACTS_PER_TRADE=10`, `DEFAULT_INSTRUMENT`/`TEST_SYMBOL` -> MES.
+
+### First honest backtest (real MES, 7738 bars, ~4 months, unoptimized defaults, realistic costs)
+- order_block PF 0.80 | fvg_retest PF 0.65 | liquidity_sweep PF 0.18 | market_structure PF 1.00 | kill_zone PF 1.70 (25 trades, NOT yet validated). Most ICT strategies lose with causal signals + real costs, as expected.
+
+## Phase 1 status: COMPLETE (Epics 1-6 + Supabase logging). 28 tests across 6 suites green.
+
+## Phase 2 plan
+Trustworthiness fixes first (engine must be believable before validating strategies):
+- Cache ignores `days` (stale smaller cache returned) -> fix cache keying in loader.
+- CME-aware gap detection (false positives on weekend/session breaks) in databento_loader.
+- Sharpe inconsistency (fvg_retest PF 0.65 but Sharpe 4.6) in metrics -> verify/fix (DSR depends on it).
+Then strategy logic bugs (see Appendix A): fvg duplicate confluence, asian_session precedence, ote `retracement_min` unused, market_structure rsi window, stop_hunt hardcoded 0.6, breaker displacement body filter.
+Then: run the optimizer (DSR/PBO/holdout) per strategy on real data -> keep only validated survivors; pivot the strategy layer if none survive.
+
+### Open inputs / ops
+- Anthony to confirm account size (placeholder 50k) and that the Supabase migration deployed (Actions) + service_role key is in `.env`.

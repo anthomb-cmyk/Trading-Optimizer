@@ -36,10 +36,9 @@ INSTRUMENTS = {
         "description":     "Micro E-mini Nasdaq-100",
         "live_only":       False,
     },
-    # ── Test / backtest proxy (stooq: SPY.US) ────────────────────────────────
-    # SPY tracks the S&P 500 and is used for strategy development and
-    # optimization until a reliable futures data feed is connected.
-    # Switch DEFAULT_TEST_SYMBOL back to "MES" when futures data is stable.
+    # ── Optional yfinance quick-look proxy (stooq: SPY.US) ───────────────────
+    # SPY tracks the S&P 500 and can be used for quick backtest sanity checks.
+    # DEFAULT_INSTRUMENT / TEST_SYMBOL are now "MES" (Databento GLBX.MDP3, live 2026-06-19).
     "SPY": {
         "ticker":          "SPY",
         "fallback_ticker": "",
@@ -79,10 +78,10 @@ INSTRUMENTS = {
 }
 
 # Symbol used by default for backtesting and optimization.
-# Set to "SPY" (stooq: SPY.US) until MES=F futures data is reliably accessible.
-# Change to "MES" when switching to live futures data.
-DEFAULT_INSTRUMENT  = "SPY"
-TEST_SYMBOL         = "SPY"
+# Switched to "MES": Databento GLBX.MDP3 feed is live and validated as of 2026-06-19.
+# SPY, QQQ, GLD remain in INSTRUMENTS as optional yfinance quick-look proxies.
+DEFAULT_INSTRUMENT  = "MES"
+TEST_SYMBOL         = "MES"
 LIVE_SYMBOLS        = ["MES", "MNQ", "MGC"]  # micro futures — paper + live
 
 # ── Timeframes ────────────────────────────────────────────────────────────────
@@ -137,7 +136,12 @@ MIN_CONFLUENCE_CONFIRMATIONS = 3
 
 # Fixed dollar risk per trade for micro futures position sizing.
 # qty = FUTURES_RISK_PER_TRADE / (SL_points × point_value)
-FUTURES_RISK_PER_TRADE = 10_000   # USD
+# Derivation: account_size (50_000) * max_risk_per_trade_pct (1.0) / 100 = 500
+FUTURES_RISK_PER_TRADE = 500      # USD  # TODO(anthony): confirm — placeholder, was 10_000
+
+# Hard cap on contracts per order; the position sizer and live bridge MUST enforce this.
+# The IB bridge currently has no quantity cap — this constant is the safety ceiling.
+MAX_CONTRACTS_PER_TRADE = 10      # TODO(anthony): confirm — placeholder
 
 # ── Risk management ───────────────────────────────────────────────────────────
 RISK = {
@@ -147,7 +151,7 @@ RISK = {
     "max_open_positions":       2,
     "default_rr_ratio":         2.0,    # reward:risk
     "min_rr_ratio":             1.5,
-    "account_size":             1_000_000.0,
+    "account_size":             50_000.0,    # TODO(anthony): confirm — placeholder, was 1_000_000.0
     "commission_per_contract":  0.62,   # NinjaTrader default MES/MNQ
 }
 

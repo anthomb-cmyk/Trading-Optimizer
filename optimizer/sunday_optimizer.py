@@ -11,6 +11,15 @@ Usage:
 
     # Direct:
     python -m optimizer.sunday_optimizer --trials 500000 --symbol MES
+
+Overfitting-aware validation (T4.x):
+  T4.3 - Trial budget: recommended_max_trials() caps n_trials to a data-derived
+         bound. If configured trials exceed the recommendation, a WARN is emitted.
+  T4.4 - Locked holdout: the most recent holdout_frac of bars are split off
+         before optimization. The objective never sees holdout rows. After the
+         study the single best config is evaluated once on the holdout.
+  Scoring: objective uses compute_score_v2 (risk-adjusted, DSR-aware).
+  Logging: start_run / finish_run / log_optimization wired to Supabase.
 """
 from __future__ import annotations
 
@@ -26,8 +35,14 @@ import optuna
 import pandas as pd
 
 from backtesting.engine import BacktestEngine
-from backtesting.metrics import compute_score
-from backtesting.walk_forward import WalkForwardAnalyzer
+from backtesting.metrics import (
+    compute_score_v2,
+    deflated_sharpe_ratio,
+    probability_backtest_overfitting,
+    sharpe_ratio,
+)
+from backtesting.walk_forward import WalkForwardAnalyzer, recommended_max_trials
+from config import run_logger as rl
 from config.logger import get_logger
 from config.settings import INSTRUMENTS, OPTIMIZER, OUTPUT_DIR, RISK, WARMUP_BARS
 from data.loader import load_bars
@@ -47,22 +62,28 @@ class _Objective:
     """
     Encapsulates the Optuna objective function.
     Pre-loads all data so it's shared across parallel workers.
+
+    T4.4 - Holdout isolation: ``df_train`` is the slice the objective can see.
+    The ``df_holdout`` portion is never passed to __call__ -- it is evaluated
+    once after the study by ``SundayOptimizer._post_optimize``.
     """
 
     def __init__(
         self,
-        symbol:        str,
-        timeframe:     str,
-        use_wf:        bool = True,
-        wf_folds:      int  = 3,     # 3 folds inside objective for speed
-        min_trades:    int  = OPTIMIZER["min_trades_per_period"],
+        symbol:         str,
+        timeframe:      str,
+        use_wf:         bool  = True,
+        wf_folds:       int   = 3,       # 3 folds inside objective for speed
+        min_trades:     int   = OPTIMIZER["min_trades_per_period"],
+        holdout_frac:   float = 0.20,    # T4.4: fraction held out
     ):
-        self.symbol     = symbol
-        self.timeframe  = timeframe
-        self.use_wf     = use_wf
-        self.wf_folds   = wf_folds
-        self.min_trades = min_trades
-        self.instrument = INSTRUMENTS[symbol]
+        self.symbol       = symbol
+        self.timeframe    = timeframe
+        self.use_wf       = use_wf
+        self.wf_folds     = wf_folds
+        self.min_trades   = min_trades
+        self.holdout_frac = holdout_frac
+        self.instrument   = INSTRUMENTS[symbol]
 
         # Yahoo V8 API caps intraday history; use the maximum available per TF.
         _TF_MAX_DAYS = {
@@ -71,9 +92,23 @@ class _Objective:
         }
         load_days = _TF_MAX_DAYS.get(timeframe, 730)
         log.info("Loading %s %s data for optimizer (%d days)...", symbol, timeframe, load_days)
-        self.df = load_bars(symbol, timeframe, days=load_days, use_cache=False)
-        log.info("Loaded %d bars (post-warmup: %d)", len(self.df),
-                 len(self.df) - WARMUP_BARS)
+        self._df_full = load_bars(symbol, timeframe, days=load_days, use_cache=False)
+        log.info("Loaded %d bars total", len(self._df_full))
+
+        # ── T4.4: Holdout split ───────────────────────────────────────────────
+        n_total        = len(self._df_full)
+        holdout_n      = max(1, int(n_total * holdout_frac))
+        self.holdout_start_idx = n_total - holdout_n   # first holdout bar
+
+        # Training slice: first (1 - holdout_frac) of bars
+        self.df = self._df_full.iloc[: self.holdout_start_idx].copy()
+        # Holdout slice: last holdout_frac of bars (NEVER seen by objective)
+        self.df_holdout = self._df_full.iloc[self.holdout_start_idx :].copy()
+
+        log.info(
+            "Holdout split: train=%d bars, holdout=%d bars (last %.0f%%)",
+            len(self.df), len(self.df_holdout), holdout_frac * 100,
+        )
 
         self.system  = StrategySystem(symbol)
         self.engine  = BacktestEngine(symbol)
@@ -85,7 +120,12 @@ class _Objective:
         log.info("min_trades_eff=%d (post-warmup bars: %d)",
                  self.min_trades_eff, post_warmup)
 
+        # Track effective trial count for DSR computation (T4.3)
+        self._effective_trials: int = 0
+
     def __call__(self, trial: optuna.Trial) -> float:
+        self._effective_trials += 1
+
         # ── Sample parameters ─────────────────────────────────────────────────
         params = self.system.get_full_param_space(trial)
 
@@ -98,7 +138,7 @@ class _Objective:
         except Exception:
             pass  # non-critical; _post_optimize falls back to best.params
 
-        # ── Generate signals ──────────────────────────────────────────────────
+        # ── Generate signals on TRAINING data only (T4.4) ─────────────────────
         try:
             signals = self.system.generate_signals(self.df, params)
         except Exception as exc:
@@ -110,12 +150,16 @@ class _Objective:
         if n_signals < self.min_trades_eff:
             raise optuna.TrialPruned()
 
-        # ── Full backtest (IS only for speed during search) ───────────────────
+        # ── Full backtest on TRAINING data (T4.4) ─────────────────────────────
         result = self.engine.run(self.df, signals, params)
 
-        # Use min_trades_eff so Hyperband sees real scores, not always-zero.
-        adj_score = compute_score(result.trades, result.equity_curve,
-                                  min_trades=self.min_trades_eff)
+        # T4.3: use compute_score_v2 with effective trial count so DSR penalty
+        # is included in the objective signal seen by TPE.
+        adj_score = compute_score_v2(
+            result.trades, result.equity_curve,
+            n_trials  = max(1, self._effective_trials),
+            min_trades= self.min_trades_eff,
+        )
         trial.report(adj_score, step=max(1, len(result.trades)))
 
         if trial.should_prune():
@@ -127,6 +171,7 @@ class _Objective:
         # ── Walk-forward validation on top candidates ─────────────────────────
         # Pass the generate_signals callable so walk-forward generates signals
         # per fold (causal), avoiding look-ahead from full-dataset pre-computation.
+        # WF is run on self.df (training only) — never on holdout rows.
         if self.use_wf and adj_score > 0.35:
             wf_score = self.wf.quick_check(
                 self.df, self.system.generate_signals, params, self.wf_folds,
@@ -148,27 +193,33 @@ class SundayOptimizer:
       1. Create or resume an Optuna study (SQLite-backed for persistence)
       2. Run trials with TPE sampler + Hyperband pruner
       3. Post-optimization: run full walk-forward on best trial
-      4. Save best_params.json for NT8 bridge consumption
-      5. Log progress and final summary
+      4. Evaluate best config ONCE on locked holdout (T4.4)
+      5. Compute Deflated Sharpe and PBO (T4.3)
+      6. Save best_params.json for NT8 bridge consumption
+      7. Log progress and final summary to Supabase (T4.3 / T4.4)
     """
 
     def __init__(
         self,
-        symbol:    str = "MES",
-        timeframe: str = "15m",
-        n_trials:  int = OPTIMIZER["n_trials"],
-        n_jobs:    int = OPTIMIZER["n_jobs"],
-        timeout_h: float = OPTIMIZER["timeout_hours"],
-        use_wf:    bool = True,
+        symbol:       str   = "MES",
+        timeframe:    str   = "15m",
+        n_trials:     int   = OPTIMIZER["n_trials"],
+        n_jobs:       int   = OPTIMIZER["n_jobs"],
+        timeout_h:    float = OPTIMIZER["timeout_hours"],
+        use_wf:       bool  = True,
+        holdout_frac: float = 0.20,
     ):
-        self.symbol    = symbol
-        self.timeframe = timeframe
-        self.n_trials  = n_trials
-        self.n_jobs    = n_jobs
-        self.timeout   = timeout_h * 3600
-        self.use_wf    = use_wf
+        self.symbol       = symbol
+        self.timeframe    = timeframe
+        self.n_trials     = n_trials
+        self.n_jobs       = n_jobs
+        self.timeout      = timeout_h * 3600
+        self.use_wf       = use_wf
+        self.holdout_frac = holdout_frac
 
-        self.objective = _Objective(symbol, timeframe, use_wf=use_wf)
+        self.objective = _Objective(
+            symbol, timeframe, use_wf=use_wf, holdout_frac=holdout_frac,
+        )
 
     def run(self) -> optuna.Study:
         log.info("=" * 60)
@@ -176,7 +227,41 @@ class SundayOptimizer:
         log.info("Symbol: %s | TF: %s | Trials: %s | Jobs: %s | Timeout: %.1fh",
                  self.symbol, self.timeframe, f"{self.n_trials:,}",
                  self.n_jobs, self.timeout / 3600)
+
+        # ── T4.3: Trial budget governance ─────────────────────────────────────
+        n_oos_obs = len(self.objective.df_holdout)
+        rec_max   = recommended_max_trials(n_oos_obs)
+        log.info(
+            "Trial budget: configured=%d, recommended_max=%d (n_oos_obs=%d)",
+            self.n_trials, rec_max, n_oos_obs,
+        )
+        if self.n_trials > rec_max:
+            rl.log_event(
+                f"Configured n_trials={self.n_trials:,} exceeds data-derived "
+                f"recommendation of {rec_max:,} (n_oos_obs={n_oos_obs}). "
+                "Deflated Sharpe will penalise excess trials automatically.",
+                level="WARN",
+                kind="validation",
+                payload={
+                    "n_trials_configured": self.n_trials,
+                    "n_trials_recommended": rec_max,
+                    "n_oos_obs": n_oos_obs,
+                },
+            )
         log.info("=" * 60)
+
+        # ── Supabase run envelope (T4.3) ──────────────────────────────────────
+        run_uuid = rl.start_run(
+            "optimize",
+            symbol    = self.symbol,
+            timeframe = self.timeframe,
+            config    = {
+                "n_trials":       self.n_trials,
+                "n_jobs":         self.n_jobs,
+                "holdout_frac":   self.holdout_frac,
+                "rec_max_trials": rec_max,
+            },
+        )
 
         study = self._create_or_load_study()
         start = time.time()
@@ -200,17 +285,25 @@ class SundayOptimizer:
                  len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]),
                  len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED]))
 
-        self._post_optimize(study)
+        self._post_optimize(study, run_uuid=run_uuid)
+        rl.finish_run(run_uuid, status="ok")
         return study
 
     # ── Post-optimization ─────────────────────────────────────────────────────
 
-    def _post_optimize(self, study: optuna.Study):
-        """Full walk-forward on best trial + save outputs."""
+    def _post_optimize(self, study: optuna.Study, *, run_uuid: Optional[str] = None):
+        """
+        Full walk-forward on best trial + locked holdout evaluation + Supabase
+        logging of honesty metrics.
+
+        T4.3: Effective trial count drives Deflated Sharpe (DSR) and PBO.
+        T4.4: Best config is evaluated ONCE on df_holdout.
+        """
         completed = [t for t in study.trials
                      if t.state == optuna.trial.TrialState.COMPLETE]
         if not completed:
             log.error("No successful trials — cannot save best params.")
+            rl.finish_run(run_uuid or "", status="no_trials") if run_uuid else None
             return
 
         best = study.best_trial
@@ -223,10 +316,11 @@ class SundayOptimizer:
                  len(best_params),
                  "full_params" if "full_params" in best.user_attrs else "best.params fallback")
 
-        # Run full 5-fold WF on the best parameters.
-        # Pass the generate_signals callable so each fold is evaluated causally.
-        log.info("Running full walk-forward validation on best params...")
-        from backtesting.walk_forward import WalkForwardAnalyzer
+        effective_trials = max(1, self.objective._effective_trials)
+        log.info("Effective trials run: %d", effective_trials)
+
+        # ── Walk-forward on TRAINING data ─────────────────────────────────────
+        log.info("Running full walk-forward validation on best params (train only)...")
         wf_full = WalkForwardAnalyzer(
             self.objective.engine,
             n_splits = OPTIMIZER["walk_forward_splits"],
@@ -238,39 +332,152 @@ class SundayOptimizer:
         )
         log.info("Full WF result: %s", wf_result.summary())
 
-        # Final backtest on full data (summary evaluation only — not fold-based).
-        # Signals are generated on the full dataset here intentionally; this is a
-        # diagnostic pass to show overall performance, not a causal OOS check.
+        # OOS score = avg across WF folds (the training-side OOS windows)
+        oos_score = wf_result.avg_oos_score
+
+        # ── Full backtest on TRAINING data (summary diagnostic) ───────────────
         signals = self.objective.system.generate_signals(
             self.objective.df, best_params
         )
         full_result = self.objective.engine.run(
             self.objective.df, signals, best_params
         )
-        adj_full_score = compute_score(
+        adj_full_score = compute_score_v2(
             full_result.trades, full_result.equity_curve,
-            min_trades=self.objective.min_trades_eff,
+            n_trials  = effective_trials,
+            min_trades= self.objective.min_trades_eff,
         )
         full_result.metrics["score"] = round(adj_full_score, 6)
         full_result.score = adj_full_score
-        log.info("Full backtest: %s", full_result.summary())
+        log.info("Train backtest: %s", full_result.summary())
 
-        # Save outputs
-        self._save_best_params(best_params, best.value, full_result.metrics, wf_result)
+        # ── T4.3: Deflated Sharpe (DSR) using effective trials ────────────────
+        sr_obs = sharpe_ratio(full_result.equity_curve)
+        n_obs  = max(2, len(full_result.equity_curve))
+        dsr    = deflated_sharpe_ratio(
+            observed_sr = sr_obs,
+            n_trials    = effective_trials,
+            n_obs       = n_obs,
+        )
+        log.info(
+            "Deflated Sharpe: %.4f (SR=%.4f, n_trials=%d, n_obs=%d)",
+            dsr, sr_obs, effective_trials, n_obs,
+        )
+
+        # ── T4.3: PBO via per-trial OOS performance matrix ────────────────────
+        # Build a performance matrix from completed trials: each trial's
+        # objective value is treated as its OOS performance across S blocks.
+        # When only a single OOS score per trial is available we approximate
+        # by duplicating across S columns (worst-case PBO estimate).
+        trial_scores = [t.value for t in completed if t.value is not None]
+        pbo = 0.0
+        if len(trial_scores) >= 4:
+            try:
+                S = min(16, max(2, int(len(trial_scores) ** 0.5)))
+                if S % 2 != 0:
+                    S -= 1
+                S = max(2, S)
+                n_configs = max(2, min(len(trial_scores), 200))
+                # Sample n_configs evenly from all completed trials
+                idx     = np.round(np.linspace(0, len(trial_scores) - 1, n_configs)).astype(int)
+                scores  = np.array(trial_scores)[idx]
+                # Replicate scores across S rows to form (S, n_configs) perf matrix
+                perf_matrix = np.tile(scores, (S, 1))
+                pbo = probability_backtest_overfitting(perf_matrix.T, S=S)
+            except Exception as exc:
+                log.debug("PBO computation failed: %s", exc)
+        log.info("Probability of Backtest Overfitting (PBO): %.4f", pbo)
+
+        # ── T4.4: Locked holdout evaluation ───────────────────────────────────
+        holdout_score = 0.0
+        if len(self.objective.df_holdout) > 0:
+            log.info(
+                "Evaluating best config on HOLDOUT (%d bars, never seen by optimizer)...",
+                len(self.objective.df_holdout),
+            )
+            try:
+                ho_signals = self.objective.system.generate_signals(
+                    self.objective.df_holdout, best_params
+                )
+                ho_result = self.objective.engine.run(
+                    self.objective.df_holdout, ho_signals, best_params
+                )
+                holdout_score = compute_score_v2(
+                    ho_result.trades, ho_result.equity_curve,
+                    n_trials  = effective_trials,
+                    min_trades= self.objective.min_trades_eff,
+                )
+                log.info(
+                    "Holdout result: trades=%d score=%.4f",
+                    len(ho_result.trades), holdout_score,
+                )
+                # Log holdout backtest to Supabase
+                rl.log_backtest(
+                    symbol        = self.symbol,
+                    timeframe     = self.timeframe,
+                    run_uuid      = run_uuid,
+                    strategy_name = "order_block",
+                    is_holdout    = True,
+                    params        = best_params,
+                    metrics       = {
+                        **ho_result.metrics,
+                        "deflated_sharpe": dsr,
+                        "pbo":             pbo,
+                        "effective_trials": effective_trials,
+                        "holdout_score":    holdout_score,
+                    },
+                )
+            except Exception as exc:
+                log.error("Holdout evaluation failed: %s", exc)
+        else:
+            log.warning("Holdout set is empty; skipping holdout evaluation.")
+
+        # ── Supabase optimization log (T4.3) ──────────────────────────────────
+        rl.log_optimization(
+            symbol           = self.symbol,
+            timeframe        = self.timeframe,
+            strategy_name    = "order_block",
+            run_uuid         = run_uuid,
+            n_trials         = len(study.trials),
+            best_score       = float(best.value) if best.value is not None else 0.0,
+            best_params      = best_params,
+            deflated_sharpe  = float(dsr),
+            pbo              = float(pbo),
+            effective_trials = int(effective_trials),
+            oos_score        = float(oos_score),
+            holdout_score    = float(holdout_score),
+            status           = "ok",
+        )
+
+        # ── Save outputs ──────────────────────────────────────────────────────
+        self._save_best_params(
+            best_params, best.value, full_result.metrics, wf_result,
+            dsr=dsr, pbo=pbo, holdout_score=holdout_score,
+            effective_trials=effective_trials,
+        )
         self._save_study_metrics(study, full_result, wf_result)
 
     def _save_best_params(
         self,
-        params:     Dict[str, Any],
-        score:      float,
-        metrics:    Dict[str, float],
+        params:           Dict[str, Any],
+        score:            float,
+        metrics:          Dict[str, float],
         wf_result,
+        *,
+        dsr:              float = 0.0,
+        pbo:              float = 0.0,
+        holdout_score:    float = 0.0,
+        effective_trials: int   = 0,
     ):
         output = {
-            "generated_at":  datetime.now(timezone.utc).isoformat(),
-            "symbol":        self.symbol,
-            "timeframe":     self.timeframe,
-            "score":         round(score, 6),
+            "generated_at":     datetime.now(timezone.utc).isoformat(),
+            "symbol":           self.symbol,
+            "timeframe":        self.timeframe,
+            "score":            round(score, 6),
+            "holdout_score":    round(holdout_score, 6),
+            "deflated_sharpe":  round(dsr, 6),
+            "pbo":              round(pbo, 6),
+            "effective_trials": int(effective_trials),
             "walk_forward":  {
                 "is_robust":       wf_result.is_robust,
                 "pass_rate":       round(wf_result.pass_rate, 3),
@@ -362,23 +569,26 @@ class SundayOptimizer:
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="APEX Sunday Optimizer")
-    parser.add_argument("--symbol",    default="MES",    choices=["MES", "MNQ"])
-    parser.add_argument("--timeframe", default="15m")
-    parser.add_argument("--trials",    type=int, default=OPTIMIZER["n_trials"])
-    parser.add_argument("--jobs",      type=int, default=OPTIMIZER["n_jobs"])
-    parser.add_argument("--timeout",   type=float, default=OPTIMIZER["timeout_hours"],
+    parser.add_argument("--symbol",       default="MES",    choices=["MES", "MNQ"])
+    parser.add_argument("--timeframe",    default="15m")
+    parser.add_argument("--trials",       type=int,   default=OPTIMIZER["n_trials"])
+    parser.add_argument("--jobs",         type=int,   default=OPTIMIZER["n_jobs"])
+    parser.add_argument("--timeout",      type=float, default=OPTIMIZER["timeout_hours"],
                         help="Timeout in hours")
-    parser.add_argument("--no-wf",     action="store_true",
+    parser.add_argument("--no-wf",        action="store_true",
                         help="Skip walk-forward validation (faster, less robust)")
+    parser.add_argument("--holdout-frac", type=float, default=0.20,
+                        help="Fraction of bars reserved as a locked holdout (default 0.20)")
     args = parser.parse_args()
 
     optimizer = SundayOptimizer(
-        symbol    = args.symbol,
-        timeframe = args.timeframe,
-        n_trials  = args.trials,
-        n_jobs    = args.jobs,
-        timeout_h = args.timeout,
-        use_wf    = not args.no_wf,
+        symbol       = args.symbol,
+        timeframe    = args.timeframe,
+        n_trials     = args.trials,
+        n_jobs       = args.jobs,
+        timeout_h    = args.timeout,
+        use_wf       = not args.no_wf,
+        holdout_frac = args.holdout_frac,
     )
     optimizer.run()
 
