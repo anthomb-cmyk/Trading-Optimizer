@@ -1,9 +1,10 @@
 """
-Append-only trade log with CSV and Excel output.
+Append-only trade log with CSV, Excel, and Supabase output.
 
 output/trade_log.csv         — one row per closed leg
 output/daily_summary.csv     — rebuilt from trade_log on every write
 output/APEX_Trade_Log.xlsx   — 3-sheet workbook, rebuilt on every write
+Supabase `trades` table      — written on every closed trade (if SUPABASE_URL/KEY set)
 """
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ from pathlib import Path
 from typing import Optional
 
 from config.logger import get_logger
+from config.supabase_client import get_client
 
 log = get_logger(__name__)
 
@@ -135,10 +137,41 @@ class TradeLogger:
             self._rebuild_daily_summary(trades)
             self._rebuild_excel(trades)
 
+        self._push_to_supabase(
+            date=entry_time.strftime("%Y-%m-%d"),
+            symbol=symbol,
+            direction=direction,
+            entry_time=entry_time.isoformat(),
+            entry_price=round(entry_price, 4),
+            exit_time=exit_time.isoformat(),
+            exit_price=round(exit_price, 4),
+            quantity=quantity,
+            gross_pnl=round((exit_price - entry_price) * (1 if direction == "LONG" else -1) * quantity, 2),
+            strategy_name=strategy_name,
+            confluence_score=confluence_score,
+            stop_loss=round(stop_loss, 4),
+            take_profit=round(take_profit, 4),
+            exit_reason=exit_reason,
+            confluences_used=confluences_used or "",
+            bias_score=bias_score,
+            kill_zone=kill_zone,
+        )
+
         log.info(
             "[TradeLog] %s %s x%d  entry=%.4f  exit=%.4f  pnl=%.2f  reason=%s",
             symbol, direction, quantity, entry_price, exit_price, gross_pnl, exit_reason,
         )
+
+    # ── Supabase ──────────────────────────────────────────────────────────────
+
+    def _push_to_supabase(self, **kwargs) -> None:
+        client = get_client()
+        if client is None:
+            return
+        try:
+            client.table("trades").insert(kwargs).execute()
+        except Exception as exc:
+            log.warning("Supabase trade insert failed: %s", exc)
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 

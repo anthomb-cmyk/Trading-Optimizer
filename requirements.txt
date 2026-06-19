@@ -42,3 +42,6 @@ colorlog>=6.8
 schedule>=1.2
 websocket-client>=1.8
 pytz>=2024.1
+
+# Supabase
+supabase>=2.0
