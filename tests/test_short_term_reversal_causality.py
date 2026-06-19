@@ -112,9 +112,19 @@ def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _signals(df: pd.DataFrame) -> pd.DataFrame:
+def _signals(df: pd.DataFrame, params: dict | None = None) -> pd.DataFrame:
     strat = ShortTermReversal(symbol="MES")
-    return strat.generate_signals(df, strat.default_params)
+    if params is None:
+        params = strat.default_params
+    return strat.generate_signals(df, params)
+
+
+def _range_params() -> dict:
+    """default_params overridden to gate on the range regime."""
+    strat = ShortTermReversal(symbol="MES")
+    p = dict(strat.default_params)
+    p["regime_mode"] = "range"
+    return p
 
 
 def _equal_cell(a, b) -> bool:
@@ -166,6 +176,54 @@ def test_append_invariance():
         f"[PASS] test_append_invariance — {settled_end} settled bars x "
         f"{len(SIGNAL_COLS)} cols checked, {mismatches} mismatches; "
         f"fired {n_long} long / {n_short} short in settled zone"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 1b — Append-invariance with regime_mode="range" gating
+# ---------------------------------------------------------------------------
+def test_append_invariance_regime_range():
+    """
+    Same append-invariance guarantee, but with the regime filter switched on
+    (regime_mode="range").  The regime gate is built from ADX / ATR-percentile,
+    both backward-only indicators, so settled signals must STILL be identical
+    on df[:k] vs df[:k+50].  This proves the regime gating did not introduce a
+    look-ahead.
+    """
+    df = _make_df()
+    k  = 400
+    assert k + 50 <= len(df)
+
+    params    = _range_params()
+    out_short = _signals(df.iloc[:k].copy(),      params)
+    out_long  = _signals(df.iloc[:k + 50].copy(), params)
+
+    settled_end = k - MARGIN
+    mismatches  = 0
+    for col in SIGNAL_COLS:
+        s = out_short[col].to_numpy()
+        l = out_long[col].to_numpy()
+        for t in range(settled_end):
+            if not _equal_cell(s[t], l[t]):
+                mismatches += 1
+                raise AssertionError(
+                    f"append-invariance (regime=range) violated in '{col}' "
+                    f"at t={t}: short={s[t]!r}, long={l[t]!r}"
+                )
+
+    # Sanity: range gating must be at least as restrictive as ungated "off".
+    out_off = _signals(df.iloc[:k].copy())
+    n_off   = int((out_off["long_signal"] | out_off["short_signal"]).iloc[:settled_end].sum())
+    n_range = int((out_short["long_signal"] | out_short["short_signal"]).iloc[:settled_end].sum())
+    assert n_range <= n_off, (
+        f"range-gated fires ({n_range}) exceed ungated fires ({n_off}) — "
+        f"gating should only remove signals, never add them"
+    )
+
+    print(
+        f"[PASS] test_append_invariance_regime_range — {settled_end} settled "
+        f"bars x {len(SIGNAL_COLS)} cols checked, {mismatches} mismatches; "
+        f"fired {n_range} (range) vs {n_off} (off) in settled zone"
     )
 
 
@@ -251,6 +309,7 @@ def test_signal_uses_only_past_or_current():
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     test_append_invariance()
+    test_append_invariance_regime_range()
     test_pure_causality_on_fires()
     test_signal_uses_only_past_or_current()
     print("\nAll ShortTermReversal causality tests passed.")

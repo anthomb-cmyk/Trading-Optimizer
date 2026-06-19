@@ -52,6 +52,7 @@ import pandas as pd
 
 from config.settings import SESSIONS
 from strategies.base_strategy import BaseStrategy
+from strategies import regime
 
 
 class VWAPReversion(BaseStrategy):
@@ -70,6 +71,7 @@ class VWAPReversion(BaseStrategy):
             "disp_window":       20,     # rolling window for VWAP-deviation dispersion (std)
             "rsi_os":            35,     # RSI oversold threshold (long confirmation)
             "rsi_ob":            65,     # RSI overbought threshold (short confirmation)
+            "regime_mode":       "off",  # regime gate: "off" | "trend" | "range" (default off = current behavior)
         }
 
     def get_param_space(self, trial: Any) -> Dict[str, Any]:
@@ -84,6 +86,8 @@ class VWAPReversion(BaseStrategy):
             "disp_window":       trial.suggest_int("vwr_disp_window",        10, 40),
             "rsi_os":            trial.suggest_int("vwr_rsi_os",             20, 45),
             "rsi_ob":            trial.suggest_int("vwr_rsi_ob",             55, 80),
+            "regime_mode":       trial.suggest_categorical("vwr_regime_mode",
+                                                           ["off", "trend", "range"]),
         }
 
     # ── Causal session-anchored VWAP ──────────────────────────────────────────
@@ -204,15 +208,28 @@ class VWAPReversion(BaseStrategy):
             vol.astype(int)
         )
 
+        # ── Regime gate (causal) ──────────────────────────────────────────────
+        # Optional regime restriction.  regime.regime_label() is built solely
+        # from causal helpers (adx / atr_percentile), so gating on it never
+        # introduces look-ahead.  "off" leaves the original behavior untouched.
+        #   "trend" -> only bars whose regime label is a trend regime
+        #   "range" -> only bars whose regime label is a range regime
+        regime_mode = p["regime_mode"]
+        if regime_mode in ("trend", "range"):
+            labels = regime.regime_label(df)
+            regime_gate = labels.str.contains(regime_mode, na=False)
+        else:
+            regime_gate = pd.Series(True, index=df.index)
+
         # ── Triggers (all required legs present; confluence gate added too) ───
         long_trigger = (
             in_session & below_band & bull_reversal &
-            vwap.notna() &
+            vwap.notna() & regime_gate &
             (long_conf >= self.min_confluence)
         )
         short_trigger = (
             in_session & above_band & bear_reversal &
-            vwap.notna() &
+            vwap.notna() & regime_gate &
             (short_conf >= self.min_confluence)
         )
 

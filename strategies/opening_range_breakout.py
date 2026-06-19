@@ -70,6 +70,7 @@ import pandas as pd
 
 from config.settings import SESSIONS
 from strategies.base_strategy import BaseStrategy
+from strategies import regime as regime_mod
 
 
 class OpeningRangeBreakout(BaseStrategy):
@@ -86,6 +87,7 @@ class OpeningRangeBreakout(BaseStrategy):
             "rr_ratio":     2.0,          # take-profit reward:risk
             "session":      "new_york",   # RTH session key (config.settings.SESSIONS)
             "require_bias": False,        # if True, HTF bias must align (4th confluence)
+            "regime_mode":  "off",        # {"off","trend","range"} regime gate (causal)
         }
 
     def get_param_space(self, trial: Any) -> Dict[str, Any]:
@@ -96,6 +98,7 @@ class OpeningRangeBreakout(BaseStrategy):
             "rr_ratio":     trial.suggest_float("orb_rr_ratio",       1.5, 4.0),
             "session":      trial.suggest_categorical("orb_session",  ["new_york", "london"]),
             "require_bias": trial.suggest_categorical("orb_require_bias", [True, False]),
+            "regime_mode":  trial.suggest_categorical("orb_regime_mode", ["off", "trend", "range"]),
         }
 
     # ── Session geometry helpers (all causal) ─────────────────────────────────
@@ -257,6 +260,18 @@ class OpeningRangeBreakout(BaseStrategy):
         if p.get("require_bias", False):
             long_trigger  = long_trigger  & (bias == 1)
             short_trigger = short_trigger & (bias == -1)
+
+        # ── Regime gate (causal) ──────────────────────────────────────────────
+        # Restrict triggers to favourable regimes using strategies.regime, whose
+        # labels/gates are append-invariant (built from causal ADX + trailing ATR
+        # percentile). "off" = no gating (preserves baseline behaviour);
+        # "trend" = only trend-regime bars; "range" = only range-regime bars.
+        regime_mode = str(p.get("regime_mode", "off"))
+        if regime_mode in ("trend", "range"):
+            labels = regime_mod.regime_label(df)
+            regime_gate = labels.str.startswith(regime_mode).fillna(False)
+            long_trigger  = long_trigger  & regime_gate
+            short_trigger = short_trigger & regime_gate
 
         out["long_signal"]  = long_trigger
         out["short_signal"] = short_trigger

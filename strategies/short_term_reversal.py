@@ -45,6 +45,7 @@ import numpy as np
 import pandas as pd
 
 from strategies.base_strategy import BaseStrategy
+from strategies import regime as regime_mod
 
 
 class ShortTermReversal(BaseStrategy):
@@ -64,6 +65,7 @@ class ShortTermReversal(BaseStrategy):
             "stretch_atr_mult": 0.0,  # min distance of close from ema_20 in ATRs
             "session":        "new_york",  # RTH session window (see SESSIONS)
             "vol_max_mult":   3.0,    # skip when ATR > this * avg ATR (vol blow-out)
+            "regime_mode":    "off",  # "off" | "trend" | "range" regime gating
         }
 
     def get_param_space(self, trial: Any) -> Dict[str, Any]:
@@ -79,6 +81,9 @@ class ShortTermReversal(BaseStrategy):
                 "str_session", ["new_york", "london", "asian"]
             ),
             "vol_max_mult":     trial.suggest_float("str_vol_max_mult",     2.0, 5.0),
+            "regime_mode":      trial.suggest_categorical(
+                "str_regime_mode", ["off", "trend", "range"]
+            ),
         }
 
     def generate_signals(self, df: pd.DataFrame, params: Dict[str, Any]) -> pd.DataFrame:
@@ -119,6 +124,19 @@ class ShortTermReversal(BaseStrategy):
         # ── Volatility regime filter (causal; uses ffilled atr/atr_avg) ───────
         vol_ok = self.volatility_filter(df, max_mult=p["vol_max_mult"], min_mult=0.0)
 
+        # ── Regime gate (causal; labels derived solely from ADX/ATR-pctile) ───
+        # regime_mode == "off"   : no gating (gate is all-True; current behavior)
+        # regime_mode == "trend" : only bars in a trend regime pass
+        # regime_mode == "range" : only bars in a range regime pass
+        # regime_label() returns one of {trend_lo, trend_hi, range_lo, range_hi},
+        # all built from backward-only indicators, so the gate is append-invariant.
+        regime_mode = str(p.get("regime_mode", "off"))
+        if regime_mode in ("trend", "range"):
+            labels = regime_mod.regime_label(df)
+            regime_ok = labels.str.contains(regime_mode).fillna(False)
+        else:
+            regime_ok = pd.Series(True, index=df.index)
+
         # ── Trigger conditions ────────────────────────────────────────────────
         sharp_down = ret <= -move_thresh                 # [1] long side
         sharp_up   = ret >=  move_thresh                 # [1] short side
@@ -131,8 +149,12 @@ class ShortTermReversal(BaseStrategy):
         long_core  = sharp_down & rsi_oversold   & below_mean
         short_core = sharp_up   & rsi_overbought & above_mean
 
-        long_trigger  = (long_core  & in_session & vol_ok & valid_extreme).fillna(False)
-        short_trigger = (short_core & in_session & vol_ok & valid_extreme).fillna(False)
+        long_trigger  = (
+            long_core  & in_session & vol_ok & regime_ok & valid_extreme
+        ).fillna(False)
+        short_trigger = (
+            short_core & in_session & vol_ok & regime_ok & valid_extreme
+        ).fillna(False)
 
         # ── Confluence count (computed for every bar; gates validity later) ───
         long_conf = (

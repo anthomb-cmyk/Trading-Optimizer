@@ -203,14 +203,15 @@ def _cols_equal(a: pd.Series, b: pd.Series) -> bool:
 # ---------------------------------------------------------------------------
 # Test 1 — Append-invariance (no repaint)
 # ---------------------------------------------------------------------------
-def test_append_invariance():
+def _assert_append_invariance(params: dict, label: str) -> int:
     """
-    Signal columns on df[:k] must equal those on df[:k+50] for every index
-    < k - margin.  Appending future bars must not change any settled signal.
+    Core append-invariance check for a given param set: signal columns on
+    df[:k] must equal those on df[:k+50] for every index < k - margin.
+    Appending future bars must not change any settled signal.  Returns the
+    number of index-checks performed.
     """
     df = _make_frame()
     strat = GapFade(symbol="MES")
-    params = strat.default_params
 
     margin = 2  # tiny guard band; the strategy emits at the entry bar (no fwd dep)
     n = len(df)
@@ -227,14 +228,37 @@ def test_append_invariance():
             s = sig_short[col].iloc[:check_end]
             l = sig_long[col].iloc[:check_end]
             assert _cols_equal(s, l), (
-                f"append-invariance violated in column '{col}' at cutpoint k={k} "
-                f"(first mismatch index "
+                f"append-invariance violated ({label}) in column '{col}' at "
+                f"cutpoint k={k} (first mismatch index "
                 f"{int(np.argmax((s.to_numpy() != l.to_numpy()) & ~(pd.isna(s.to_numpy()) & pd.isna(l.to_numpy()))))})"
             )
         total_checked += check_end
 
-    print(f"[PASS] test_append_invariance — {len(cutpoints)} cutpoints, "
+    print(f"[PASS] test_append_invariance[{label}] — {len(cutpoints)} cutpoints, "
           f"{total_checked} index-checks across {len(_SIGNAL_COLS)} columns")
+    return total_checked
+
+
+def test_append_invariance():
+    """
+    Signal columns on df[:k] must equal those on df[:k+50] for every index
+    < k - margin.  Appending future bars must not change any settled signal.
+    """
+    strat = GapFade(symbol="MES")
+    _assert_append_invariance(strat.default_params, "default(regime_off)")
+
+
+def test_append_invariance_regime_range():
+    """
+    Same append-invariance guarantee must hold with the regime gate engaged
+    (regime_mode="range").  The gate is built from strategies.regime helpers,
+    which are causal, so engaging it must not introduce any look-ahead: a
+    settled signal on df[:k] must still match df[:k+50].
+    """
+    strat = GapFade(symbol="MES")
+    params = {**strat.default_params, "regime_mode": "range"}
+    assert params["regime_mode"] == "range"
+    _assert_append_invariance(params, "regime_range")
 
 
 # ---------------------------------------------------------------------------
@@ -317,5 +341,6 @@ def test_signals_fire():
 if __name__ == "__main__":
     test_signals_fire()
     test_append_invariance()
+    test_append_invariance_regime_range()
     test_truncation_causality()
     print("\nAll gap_fade causality tests passed.")

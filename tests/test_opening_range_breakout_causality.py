@@ -211,6 +211,56 @@ def test_orb_append_invariance_alt_params():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Test 2b — append-invariance with the regime gate active (regime_mode="trend")
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_orb_append_invariance_regime_trend():
+    """
+    Layering the regime filter (regime_mode="trend") must not break
+    append-invariance. The gate is built from strategies.regime, whose labels
+    derive from causal ADX + trailing ATR-percentile, so a settled bar's signal
+    must be identical whether or not future bars are appended.
+
+    The regime helpers carry a longer warmup (ATR percentile window=100, ADX
+    ~2*period), all comfortably inside the MARGIN=110 settled-zone buffer.
+    """
+    df = _make_df()
+    k  = CUTPOINT
+    settled_end = k - MARGIN
+
+    strat  = OpeningRangeBreakout(symbol="MES")
+    params = {**strat.default_params, "regime_mode": "trend"}
+
+    out_short = strat.generate_signals(df.iloc[:k].copy(),              params)
+    out_long  = strat.generate_signals(df.iloc[:k + EXTRA_BARS].copy(), params)
+
+    for col in SIGNAL_COLS:
+        _check_invariant(f"regime_trend[{col}]", out_short[col], out_long[col], settled_end)
+
+    # The gate must actually remove some signals relative to "off" — otherwise the
+    # test would not really exercise the regime path. We assert the trend-gated
+    # signal set is a subset of the ungated one within the settled zone.
+    out_off = strat.generate_signals(
+        df.iloc[:k].copy(), {**strat.default_params, "regime_mode": "off"}
+    )
+    for col in ("long_signal", "short_signal"):
+        gated   = out_short[col].iloc[:settled_end].astype(bool).values
+        ungated = out_off[col].iloc[:settled_end].astype(bool).values
+        assert np.all(ungated[gated]), (
+            f"[regime_trend] gated {col} fired where ungated did not — "
+            f"gate is not a pure restriction of the baseline."
+        )
+
+    n_off  = int(out_off["long_signal"].iloc[:settled_end].sum()
+                 + out_off["short_signal"].iloc[:settled_end].sum())
+    n_gate = int(out_short["long_signal"].iloc[:settled_end].sum()
+                 + out_short["short_signal"].iloc[:settled_end].sum())
+    assert n_off > 0, "Baseline (off) fired no signals — test would be vacuous."
+    print(f"[PASS] test_orb_append_invariance_regime_trend — {settled_end} indices, "
+          f"signals off={n_off}, trend-gated={n_gate}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Test 3 — pure causality: truncate at t+1 for every fired signal
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -310,6 +360,7 @@ if __name__ == "__main__":
     print("Running opening_range_breakout causality tests...\n")
     test_orb_append_invariance_default()
     test_orb_append_invariance_alt_params()
+    test_orb_append_invariance_regime_trend()
     test_orb_no_future_dependency()
     test_orb_first_per_session_and_geometry()
     print("\nAll opening_range_breakout causality tests passed.")

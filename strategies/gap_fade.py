@@ -61,6 +61,7 @@ import pandas as pd
 
 from config.settings import SESSIONS
 from strategies.base_strategy import BaseStrategy
+from strategies import regime as regime_mod
 
 
 class GapFade(BaseStrategy):
@@ -78,6 +79,7 @@ class GapFade(BaseStrategy):
             "session":       "new_york",
             "confirm_bars":  0,      # 0 = enter on open bar; N = wait N bars for confirmation
             "use_bias":      True,   # require HTF bias alignment for confluence weight
+            "regime_mode":   "off",  # "off" | "trend" | "range" — causal regime gate (default off preserves behavior)
         }
 
     def get_param_space(self, trial: Any) -> Dict[str, Any]:
@@ -88,6 +90,9 @@ class GapFade(BaseStrategy):
             "max_hold_bars": trial.suggest_int("gf_max_hold_bars",   8,  40),
             "confirm_bars":  trial.suggest_int("gf_confirm_bars",    0,   3),
             "use_bias":      trial.suggest_categorical("gf_use_bias", [True, False]),
+            "regime_mode":   trial.suggest_categorical(
+                "gf_regime_mode", ["off", "trend", "range"]
+            ),
         }
 
     # ── Signal generation ──────────────────────────────────────────────────────
@@ -172,6 +177,22 @@ class GapFade(BaseStrategy):
 
         long_trigger  = long_setup  & (long_conf  >= self.min_confluence)
         short_trigger = short_setup & (short_conf >= self.min_confluence)
+
+        # ── Step 6b: Regime gate (causal) ──────────────────────────────────────
+        # Restrict triggers to a favorable regime when the optimizer asks for it.
+        # The gate is built only from strategies.regime helpers, which derive
+        # every value at bar t from bars <= t (append-invariant). regime_label
+        # emits {"trend_lo","trend_hi","range_lo","range_hi"}; we AND the long /
+        # short triggers with the appropriate axis. "off" leaves triggers
+        # untouched (default → current behavior).
+        regime_mode = str(p["regime_mode"])
+        if regime_mode in ("trend", "range"):
+            allow = {
+                lab for lab in regime_mod.REGIME_LABELS if regime_mode in lab
+            }
+            regime_gate = regime_mod.regime_ok(df, allow=allow)
+            long_trigger  = long_trigger  & regime_gate
+            short_trigger = short_trigger & regime_gate
 
         out["long_signal"]  = long_trigger
         out["short_signal"] = short_trigger

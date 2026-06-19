@@ -143,15 +143,12 @@ def _equal_series(a: pd.Series, b: pd.Series, atol: float = 0.0) -> bool:
 # ---------------------------------------------------------------------------
 # Test 1 — Append-invariance of all signal columns
 # ---------------------------------------------------------------------------
-def test_signal_append_invariance():
+def _run_append_invariance(strat, df, params, label):
     """
-    For multiple cut points k, the strategy's signal columns on df[:k] must
-    equal those on df[:k+50] for every index < k - MARGIN.
+    Shared driver: for multiple cut points k, the strategy's signal columns on
+    df[:k] must equal those on df[:k+50] for every index < k - MARGIN.
+    Returns (total_long, total_short) over the settled regions.
     """
-    df    = _make_frame()
-    strat = VWAPReversion(symbol="MES")
-    params = strat.default_params
-
     cut_points = [300, 500, 800, 1000]
     total_long = total_short = 0
 
@@ -166,15 +163,47 @@ def test_signal_append_invariance():
             s = short[col].iloc[:settled_end]
             l = long_[col].iloc[:settled_end]
             assert _equal_series(s, l), (
-                f"append-invariance violated for column '{col}' at cut k={k}: "
-                f"a future-bar extension changed a settled value before index {settled_end}"
+                f"append-invariance violated for column '{col}' at cut k={k} "
+                f"[{label}]: a future-bar extension changed a settled value "
+                f"before index {settled_end}"
             )
 
         total_long  += int(short["long_signal"].iloc[:settled_end].sum())
         total_short += int(short["short_signal"].iloc[:settled_end].sum())
 
-    print(f"[PASS] test_signal_append_invariance — {len(cut_points)} cut points, "
-          f"settled longs={total_long}, settled shorts={total_short}, "
+    return total_long, total_short
+
+
+def test_signal_append_invariance():
+    """
+    For multiple cut points k, the strategy's signal columns on df[:k] must
+    equal those on df[:k+50] for every index < k - MARGIN.
+
+    Runs with the default params (regime_mode="off") AND with the regime gate
+    enabled (regime_mode="range").  The regime gate is built from strategies.
+    regime helpers (adx / atr_percentile), which are causal, so enabling it must
+    NOT break append-invariance of any settled signal.
+    """
+    df    = _make_frame()
+    strat = VWAPReversion(symbol="MES")
+
+    # Default behavior: regime_mode == "off".
+    base_params = strat.default_params
+    assert base_params["regime_mode"] == "off", "default regime_mode must be 'off'"
+    off_long, off_short = _run_append_invariance(strat, df, base_params, "regime_mode=off")
+
+    # Regime-gated behavior: regime_mode == "range" (the strategy's natural regime).
+    range_params = {**base_params, "regime_mode": "range"}
+    rng_long, rng_short = _run_append_invariance(strat, df, range_params, "regime_mode=range")
+
+    # The range gate restricts entries, so it can only ever drop signals, never
+    # add them — a sanity check that the gate is actually doing something causal.
+    assert rng_long  <= off_long,  "range gate should not create extra long signals"
+    assert rng_short <= off_short, "range gate should not create extra short signals"
+
+    print(f"[PASS] test_signal_append_invariance — 4 cut points x 2 regime modes, "
+          f"off(longs={off_long}, shorts={off_short}) / "
+          f"range(longs={rng_long}, shorts={rng_short}), "
           f"all {len(SIGNAL_COLS)} signal columns invariant under +50 future bars")
 
 
@@ -193,37 +222,47 @@ def test_signal_truncation_causality():
     """
     df    = _make_frame()
     strat = VWAPReversion(symbol="MES")
-    params = strat.default_params
 
     raw = df[["open", "high", "low", "close", "volume"]]
-    full = strat.generate_signals(df.copy(), params)
 
-    sig_bars = np.where(
-        (full["long_signal"] | full["short_signal"]).to_numpy()
-    )[0]
-    # Only test bars past the warmup band so indicators are defined.
-    sig_bars = [int(t) for t in sig_bars if t >= MARGIN]
+    # Exercise both the ungated default and the regime-gated ("range") path so
+    # the regime gate is held to the same hard-truncation standard: the regime
+    # label at bar t (adx / atr_percentile) must use only bars <= t.
+    param_sets = {
+        "regime_mode=off":   strat.default_params,
+        "regime_mode=range": {**strat.default_params, "regime_mode": "range"},
+    }
 
-    # Plus a sample of non-signal bars for spurious-True protection.
-    sample = list(range(MARGIN, len(df), 97))
-    check_bars = sorted(set(sig_bars) | set(sample))
+    total_checked = 0
+    for label, params in param_sets.items():
+        full = strat.generate_signals(df.copy(), params)
 
-    checked = 0
-    for t in check_bars:
-        trunc_raw = raw.iloc[: t + 1].copy()
-        trunc_df  = _add_indicators(trunc_raw)
-        trunc_sig = strat.generate_signals(trunc_df, params)
-        assert len(trunc_sig) == t + 1
+        sig_bars = np.where(
+            (full["long_signal"] | full["short_signal"]).to_numpy()
+        )[0]
+        # Only test bars past the warmup band so indicators are defined.
+        sig_bars = [int(t) for t in sig_bars if t >= MARGIN]
 
-        for col in ("long_signal", "short_signal"):
-            assert bool(trunc_sig[col].iloc[t]) == bool(full[col].iloc[t]), (
-                f"truncation causality violated for '{col}' at t={t}: "
-                f"full={bool(full[col].iloc[t])}, truncated={bool(trunc_sig[col].iloc[t])}"
-            )
-        checked += 1
+        # Plus a sample of non-signal bars for spurious-True protection.
+        sample = list(range(MARGIN, len(df), 97))
+        check_bars = sorted(set(sig_bars) | set(sample))
 
-    print(f"[PASS] test_signal_truncation_causality — {len(sig_bars)} signal bars + "
-          f"{len(sample)} sampled bars ({checked} total) match under hard truncation")
+        for t in check_bars:
+            trunc_raw = raw.iloc[: t + 1].copy()
+            trunc_df  = _add_indicators(trunc_raw)
+            trunc_sig = strat.generate_signals(trunc_df, params)
+            assert len(trunc_sig) == t + 1
+
+            for col in ("long_signal", "short_signal"):
+                assert bool(trunc_sig[col].iloc[t]) == bool(full[col].iloc[t]), (
+                    f"truncation causality violated for '{col}' at t={t} "
+                    f"[{label}]: full={bool(full[col].iloc[t])}, "
+                    f"truncated={bool(trunc_sig[col].iloc[t])}"
+                )
+            total_checked += 1
+
+    print(f"[PASS] test_signal_truncation_causality — {total_checked} (bar, regime_mode) "
+          f"checks match under hard truncation across off/range gating")
 
 
 # ---------------------------------------------------------------------------

@@ -66,6 +66,18 @@ _TF_MAX_DAYS: Dict[str, int] = {
     "1h": 730, "4h": 730, "1d": 730, "1w": 730,
 }
 
+# ── Trade-frequency annualization basis ──────────────────────────────────────
+# Used to convert a raw trade count over a scored window into trades-per-year so
+# the optimizer cannot hide in degenerate low-trade configs (the prior holdout
+# was under-powered at 3-5 trades). Basis: equity-index futures (MES/MNQ/...)
+# trade ~64 RTH 15m bars per session (09:30-16:00 = 6.5h = 26 15m bars; the
+# extended-hours/globex envelope this loader fetches widens that to ~64 bars/day)
+# across ~252 trading days per year -> 64 * 252 = 16128 bars/year. This is the
+# per-bar denominator; on coarser timeframes the strategy simply produces fewer
+# bars per window, so trades_per_year scales down naturally and the same
+# min_trades_per_year floor still applies.
+BARS_PER_YEAR: int = 64 * 252  # ≈ 16128
+
 
 # ── Objective ─────────────────────────────────────────────────────────────────
 
@@ -80,32 +92,36 @@ class _StrategyObjective:
 
     def __init__(
         self,
-        strategy_name: str,
-        symbol:        str,
-        timeframe:     str,
-        use_wf:        bool  = True,
-        wf_folds:      int   = 3,
-        min_trades:    int   = OPTIMIZER["min_trades_per_period"],
-        holdout_frac:  float = 0.20,
+        strategy_name:       str,
+        symbol:              str,
+        timeframe:           str,
+        use_wf:              bool  = True,
+        wf_folds:            int   = 3,
+        min_trades:          int   = OPTIMIZER["min_trades_per_period"],
+        holdout_frac:        float = 0.20,
+        min_trades_per_year: float = 50.0,
+        days:                Optional[int] = None,
+        use_cache:           bool  = True,
     ):
-        self.strategy_name = strategy_name
-        self.symbol        = symbol
-        self.timeframe     = timeframe
-        self.use_wf        = use_wf
-        self.wf_folds      = wf_folds
-        self.min_trades    = min_trades
-        self.holdout_frac  = holdout_frac
+        self.strategy_name       = strategy_name
+        self.symbol              = symbol
+        self.timeframe           = timeframe
+        self.use_wf              = use_wf
+        self.wf_folds            = wf_folds
+        self.min_trades          = min_trades
+        self.holdout_frac        = holdout_frac
+        self.min_trades_per_year = float(min_trades_per_year)
 
         # Instantiate the strategy (reads symbol for instrument config)
         self.strategy = get_strategy(strategy_name, symbol)
 
         # Load bars
-        load_days = _TF_MAX_DAYS.get(timeframe, 730)
+        load_days = days if days is not None else _TF_MAX_DAYS.get(timeframe, 730)
         log.info(
-            "Loading %s %s data for strategy optimizer (%d days)...",
-            symbol, timeframe, load_days,
+            "Loading %s %s data for strategy optimizer (%d days, cache=%s)...",
+            symbol, timeframe, load_days, use_cache,
         )
-        self._df_full = load_bars(symbol, timeframe, days=load_days, use_cache=False)
+        self._df_full = load_bars(symbol, timeframe, days=load_days, use_cache=use_cache)
         log.info("Loaded %d bars total", len(self._df_full))
 
         # ── T4.4: Holdout split ───────────────────────────────────────────────
@@ -187,6 +203,24 @@ class _StrategyObjective:
         else:
             final_score = adj_score
 
+        # ── Minimum-trade-frequency penalty ───────────────────────────────────
+        # Annualize the trade count over the scored window so the search cannot
+        # hide in degenerate low-trade configs (the prior holdout was under-
+        # powered at 3-5 trades). n_scored_bars is the training window the score
+        # was computed over; BARS_PER_YEAR (=64*252≈16128) is the documented
+        # per-bar annualization basis (see module top).
+        n_scored_bars  = max(1, len(self.df))
+        total_trades   = len(result.trades)
+        trades_per_year = total_trades / (n_scored_bars / BARS_PER_YEAR)
+        trial.set_user_attr("trades_per_year", float(trades_per_year))
+
+        # Smooth linear penalty toward 0 for configs that trade too rarely:
+        # below the floor the score is scaled by (tpy / min_tpy); at/above the
+        # floor it is untouched. Pushes the optimizer to configs that trade
+        # often enough to validate.
+        if self.min_trades_per_year > 0 and trades_per_year < self.min_trades_per_year:
+            final_score *= trades_per_year / self.min_trades_per_year
+
         return float(final_score)
 
 
@@ -208,29 +242,36 @@ class StrategyOptimizer:
 
     def __init__(
         self,
-        strategy_name: str,
-        symbol:        str   = "MES",
-        timeframe:     str   = "15m",
-        n_trials:      Optional[int]   = None,   # None → recommended_max_trials
-        n_jobs:        int   = 1,
-        timeout_h:     Optional[float] = None,
-        holdout_frac:  float = 0.20,
-        use_wf:        bool  = True,
+        strategy_name:       str,
+        symbol:              str   = "MES",
+        timeframe:           str   = "15m",
+        n_trials:            Optional[int]   = None,   # None → recommended_max_trials
+        n_jobs:              int   = 1,
+        timeout_h:           Optional[float] = None,
+        holdout_frac:        float = 0.20,
+        use_wf:              bool  = True,
+        min_trades_per_year: float = 50.0,
+        days:                Optional[int] = None,
+        use_cache:           bool  = True,
     ):
-        self.strategy_name = strategy_name
-        self.symbol        = symbol
-        self.timeframe     = timeframe
-        self.n_jobs        = n_jobs
-        self.timeout       = (timeout_h or 0.0) * 3600  # 0 → no timeout
-        self.holdout_frac  = holdout_frac
-        self.use_wf        = use_wf
+        self.strategy_name       = strategy_name
+        self.symbol              = symbol
+        self.timeframe           = timeframe
+        self.n_jobs              = n_jobs
+        self.timeout             = (timeout_h or 0.0) * 3600  # 0 → no timeout
+        self.holdout_frac        = holdout_frac
+        self.use_wf              = use_wf
+        self.min_trades_per_year = float(min_trades_per_year)
 
         self.objective = _StrategyObjective(
-            strategy_name = strategy_name,
-            symbol        = symbol,
-            timeframe     = timeframe,
-            use_wf        = use_wf,
-            holdout_frac  = holdout_frac,
+            strategy_name       = strategy_name,
+            symbol              = symbol,
+            timeframe           = timeframe,
+            use_wf              = use_wf,
+            holdout_frac        = holdout_frac,
+            min_trades_per_year = min_trades_per_year,
+            days                = days,
+            use_cache           = use_cache,
         )
 
         # Default n_trials: data-derived recommendation (T4.3), NOT 500k
@@ -376,6 +417,20 @@ class StrategyOptimizer:
             min_trades = self.objective.min_trades_eff,
         )
         train_result.metrics["score"] = round(adj_train, 6)
+
+        # ── Trade frequency (annualized) on the training window ────────────────
+        # Same basis as the in-objective penalty: total_trades over the scored
+        # bars, annualized by BARS_PER_YEAR (=64*252≈16128). Surfaced so a
+        # config that passed only by trading rarely is visible in the headline.
+        n_train_bars    = max(1, len(self.objective.df))
+        trades_per_year = len(train_result.trades) / (n_train_bars / BARS_PER_YEAR)
+        train_result.metrics["trades_per_year"] = round(trades_per_year, 2)
+        log.info(
+            "Trade frequency: %.1f trades/year (%d trades over %d train bars; "
+            "min_trades_per_year=%.0f)",
+            trades_per_year, len(train_result.trades), n_train_bars,
+            self.min_trades_per_year,
+        )
         log.info("Train backtest: %s", train_result.summary())
 
         # ── T4.3: FIXED Deflated Sharpe (per-observation basis) ───────────────
@@ -489,6 +544,7 @@ class StrategyOptimizer:
             effective_trials = effective_trials,
             wf_result        = wf_result,
             is_robust        = is_robust,
+            trades_per_year  = trades_per_year,
         )
         out_path = OUTPUT_DIR / f"strategy_best_{self.strategy_name}.json"
         out_path.write_text(json.dumps(output, indent=2, default=str), encoding="utf-8")
@@ -618,6 +674,7 @@ class StrategyOptimizer:
         effective_trials: int,
         wf_result,
         is_robust:        bool,
+        trades_per_year:  float,
     ) -> Dict[str, Any]:
         def _clean(v):
             if isinstance(v, (np.integer,)):
@@ -637,6 +694,8 @@ class StrategyOptimizer:
             "deflated_sharpe":  round(dsr, 6),
             "pbo":              (round(pbo, 6) if pbo is not None else None),
             "effective_trials": int(effective_trials),
+            "trades_per_year":      round(trades_per_year, 2),  # annualized; basis BARS_PER_YEAR
+            "min_trades_per_year":  self.min_trades_per_year,   # frequency floor applied in objective
             "walk_forward": {
                 "is_robust":       wf_result.is_robust,
                 "pass_rate":       round(wf_result.pass_rate, 3),
@@ -672,17 +731,28 @@ def main():
     parser.add_argument("--no-wf",     action="store_true",
                         help="Skip walk-forward validation (faster, less robust)")
     parser.add_argument("--holdout-frac", type=float, default=0.20)
+    parser.add_argument("--min-trades-per-year", type=float, default=50.0,
+                        help="Minimum annualized trade frequency (default 50). "
+                             "Configs trading below this floor have their objective "
+                             "score linearly penalized toward 0.")
+    parser.add_argument("--days", type=int, default=None,
+                        help="History window in days (default: timeframe max)")
+    parser.add_argument("--refetch", action="store_true",
+                        help="Force a fresh Databento fetch instead of using cache")
     args = parser.parse_args()
 
     optimizer = StrategyOptimizer(
-        strategy_name = args.strategy,
-        symbol        = args.symbol,
-        timeframe     = args.timeframe,
-        n_trials      = args.trials,
-        n_jobs        = args.jobs,
-        timeout_h     = args.timeout,
-        holdout_frac  = args.holdout_frac,
-        use_wf        = not args.no_wf,
+        strategy_name       = args.strategy,
+        symbol              = args.symbol,
+        timeframe           = args.timeframe,
+        n_trials            = args.trials,
+        n_jobs              = args.jobs,
+        timeout_h           = args.timeout,
+        holdout_frac        = args.holdout_frac,
+        use_wf              = not args.no_wf,
+        min_trades_per_year = args.min_trades_per_year,
+        days                = args.days,
+        use_cache           = not args.refetch,
     )
     result = optimizer.run()
 
@@ -693,6 +763,8 @@ def main():
     print(f"  Best train OOS score : {result.get('best_score', 'N/A'):.4f}")
     print(f"  Holdout score        : {result.get('holdout_score', 'N/A'):.4f}")
     print(f"  Deflated Sharpe (DSR): {result.get('deflated_sharpe', 'N/A'):.4f}")
+    print(f"  Trades / year        : {result.get('trades_per_year', 0):.1f}  "
+          f"(floor={result.get('min_trades_per_year', 0):.0f})")
     pbo_val = result.get("pbo")
     print(f"  PBO                  : {'UNDEFINED' if pbo_val is None else f'{pbo_val:.4f}'}")
     wf = result.get("walk_forward", {})
