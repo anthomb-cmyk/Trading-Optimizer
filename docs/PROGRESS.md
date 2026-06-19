@@ -132,3 +132,19 @@ Honest reality: even documented edges lose on defaults with real costs. ORB is t
 
 ### Next: Phase 3 wave 2
 The existing optimizer drives the ICT StrategySystem, not standalone strategies. Build a per-strategy optimizer (single strategy + its get_param_space, reusing the locked holdout + walk-forward + compute_score_v2 + fixed DSR/PBO + Supabase logging), then run it sequentially (8GB M1) on the 4 new strategies to get honest validated verdicts. Apply the regime filter to any survivor.
+
+## 2026-06-19 - Phase 3 wave 2: honest per-strategy validation (THE VERDICT)
+Built `optimizer/strategy_optimizer.py` (per-strategy locked holdout + walk-forward + FIXED DSR/PBO + Supabase logging; CLI `main.py optimize-strategy`). Validated the 4 new strategies on 1yr MES (23,376 bars, 73-day locked holdout, 250 trials each, single-core):
+
+| strat | train OOS | holdout score | DSR | WF robust | holdout PF | holdout trades |
+|---|---|---|---|---|---|---|
+| opening_range_breakout | 0.347 | 0.0 | 0.009 | False (0%) | 0.38 | 3 |
+| vwap_reversion | 0.349 | 0.0 | 0.010 | False (0%) | 3.96* | 4 |
+| gap_fade | 0.343 | 0.0 | 0.010 | False (0%) | 0.38 | 5 |
+| short_term_reversal | 0.349 | 0.0 | 0.018 | False (0%) | 1.81* | 4 |
+
+VERDICT: NONE survive honest validation. DSR ~0.01 (no edge after deflation), walk-forward 0% fold pass, holdout fails. *vwap/short_term holdout PF look positive but on 3-5 trades = noise. Guardrails confirmed working (DSR ~0.01 on no-edge, not the old false 1.0).
+CAVEAT: the optimizer selected low-trade-frequency configs, so the holdout had only 3-5 trades (under-powered). The decisive signals are the train walk-forward 0% fold-pass + DSR ~0.01. A more rigorous retry would use multi-year data + a minimum-trade-frequency penalty in the objective.
+
+## Where this leaves the project
+Two honest negatives now: ICT (no edge) AND four textbook evidence-based edges (no validated edge) on MES 15m, default search. The durable asset delivered is the HONEST ENGINE that reliably separates truth from noise (it correctly fails ICT, fails textbook edges, and finds nothing in random data). Realistic next options (all uncertain): (a) multi-year data + frequency-constrained re-search; (b) LLM news/sentiment overlay (the AI differentiator); (c) regime-filtered ensembles; (d) accept the verdict and stop scaling effort. Decision pending.

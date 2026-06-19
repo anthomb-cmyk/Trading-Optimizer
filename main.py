@@ -73,6 +73,44 @@ def cmd_optimize(args):
     opt.run()
 
 
+def cmd_optimize_strategy(args):
+    from optimizer.strategy_optimizer import StrategyOptimizer
+
+    optimizer = StrategyOptimizer(
+        strategy_name = args.strategy,
+        symbol        = args.symbol,
+        timeframe     = args.timeframe,
+        n_trials      = args.trials,
+        n_jobs        = args.jobs,
+        timeout_h     = args.timeout,
+        use_wf        = not args.no_wf,
+        holdout_frac  = args.holdout_frac,
+    )
+    result = optimizer.run()
+
+    # Headline verdict
+    print("\n" + "=" * 60)
+    print(f"STRATEGY OPTIMIZER RESULT: {args.strategy}")
+    print("=" * 60)
+    print(f"  Best train OOS score : {result.get('best_score', 0):.4f}")
+    print(f"  Holdout score        : {result.get('holdout_score', 0):.4f}")
+    print(f"  Deflated Sharpe (DSR): {result.get('deflated_sharpe', 0):.4f}")
+    pbo_val = result.get("pbo")
+    print(f"  PBO                  : {'UNDEFINED' if pbo_val is None else f'{pbo_val:.4f}'}")
+    wf = result.get("walk_forward", {})
+    print(f"  WF robust            : {wf.get('is_robust', 'N/A')}  "
+          f"(pass_rate={wf.get('pass_rate', 0):.0%})")
+    hm = result.get("holdout_metrics", {})
+    print(f"  Holdout PF           : {hm.get('profit_factor', 0):.2f}")
+    print(f"  Holdout Sharpe       : {hm.get('sharpe', 0):.2f}")
+    print(f"  Holdout Trades       : {hm.get('total_trades', 0)}")
+    print(f"  Holdout MaxDD        : {hm.get('max_drawdown', 0):.1%}")
+    print(f"  Holdout net PnL      : "
+          f"{hm.get('gross_profit', 0) - hm.get('gross_loss', 0):.0f}")
+    print(f"  Is robust            : {result.get('is_robust', False)}")
+    print("=" * 60)
+
+
 def cmd_report(args):
     log.info("Reporting not yet implemented — coming in Phase 7.")
 
@@ -194,6 +232,27 @@ def build_parser() -> argparse.ArgumentParser:
     po.add_argument("--timeout",   type=float, default=None, help="Hours")
     po.add_argument("--no-wf",     action="store_true", help="Skip walk-forward")
     po.set_defaults(func=cmd_optimize)
+
+    # optimize-strategy
+    pos = sub.add_parser(
+        "optimize-strategy",
+        help="Run single-strategy honest optimizer (honest DSR/PBO, locked holdout)",
+    )
+    pos.add_argument("--strategy",  required=True,
+                     help="Strategy name, e.g. short_term_reversal")
+    pos.add_argument("--symbol",    default="MES")
+    pos.add_argument("--timeframe", default="15m")
+    pos.add_argument("--trials",    type=int,   default=None,
+                     help="Optuna trial budget (default: data-derived rec)")
+    pos.add_argument("--jobs",      type=int,   default=1)
+    pos.add_argument("--timeout",   type=float, default=None,
+                     help="Timeout in hours (0 / omit = none)")
+    pos.add_argument("--no-wf",     action="store_true",
+                     help="Skip walk-forward validation inside the objective")
+    pos.add_argument("--holdout-frac", type=float, default=0.20,
+                     dest="holdout_frac",
+                     help="Fraction of bars reserved as locked holdout (default 0.20)")
+    pos.set_defaults(func=cmd_optimize_strategy)
 
     # report
     pr = sub.add_parser("report", help="Generate HTML performance report")
