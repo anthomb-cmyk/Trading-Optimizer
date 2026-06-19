@@ -36,6 +36,13 @@ from config.settings import (
     SMC,
     VOLATILITY,
 )
+from strategies.detectors import (  # causal detector functions (T1.2)
+    detect_fvg,
+    detect_fvg_zones,
+    detect_order_blocks,
+    detect_bos,
+    detect_choch,
+)
 
 
 _SIGNAL_COLS = {
@@ -130,64 +137,23 @@ class BaseStrategy(ABC):
         df["short_signal"] = df["short_signal"] & df["valid"]
         return df
 
-    # ── SMC detectors (shared across all strategies) ─────────────────────────
+    # ── SMC detectors — implementations live in strategies/detectors.py (T1.2) ──
 
     @staticmethod
     def detect_fvg(
         df: pd.DataFrame,
         min_atr_mult: float = 0.3,
     ) -> Tuple[pd.Series, pd.Series]:
-        """
-        Fair Value Gap detection (3-candle imbalance).
-
-        Bullish FVG: candle[i-2].high < candle[i].low  — unfilled gap above
-        Bearish FVG: candle[i-2].low  > candle[i].high — unfilled gap below
-
-        Returns (bull_fvg, bear_fvg) boolean Series marking the MIDDLE candle.
-        """
-        atr     = df["atr"].ffill()
-        min_gap = atr * min_atr_mult
-
-        high_2 = df["high"].shift(2)
-        low_2  = df["low"].shift(2)
-
-        bull_fvg = (high_2 < df["low"])  & ((df["low"]  - high_2) >= min_gap)
-        bear_fvg = (low_2  > df["high"]) & ((low_2 - df["high"])  >= min_gap)
-
-        return bull_fvg.fillna(False), bear_fvg.fillna(False)
+        """Fair Value Gap detection. Causal as-is. See strategies/detectors.py."""
+        return detect_fvg(df, min_atr_mult)
 
     @staticmethod
     def detect_fvg_zones(
         df: pd.DataFrame,
         min_atr_mult: float = 0.3,
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """
-        Returns DataFrames for open (unfilled) FVG zones.
-        Each row: top, bottom, midpoint of the gap, age (bars since formation).
-
-        Bullish FVG zone: bottom = candle[i-2].high, top = candle[i].low
-        Bearish FVG zone: top = candle[i-2].low, bottom = candle[i].high
-        """
-        atr     = df["atr"].ffill()
-        min_gap = atr * min_atr_mult
-        high_2  = df["high"].shift(2)
-        low_2   = df["low"].shift(2)
-
-        bull_mask = (high_2 < df["low"])  & ((df["low"]  - high_2) >= min_gap)
-        bear_mask = (low_2  > df["high"]) & ((low_2 - df["high"])  >= min_gap)
-
-        # Bullish FVG zone columns
-        bull_zones = pd.DataFrame(index=df.index)
-        bull_zones["top"]    = df["low"].where(bull_mask)
-        bull_zones["bottom"] = high_2.where(bull_mask)
-        bull_zones["mid"]    = ((bull_zones["top"] + bull_zones["bottom"]) / 2)
-
-        bear_zones = pd.DataFrame(index=df.index)
-        bear_zones["top"]    = low_2.where(bear_mask)
-        bear_zones["bottom"] = df["high"].where(bear_mask)
-        bear_zones["mid"]    = ((bear_zones["top"] + bear_zones["bottom"]) / 2)
-
-        return bull_zones, bear_zones
+        """FVG zone bounds. Causal as-is. See strategies/detectors.py."""
+        return detect_fvg_zones(df, min_atr_mult)
 
     @staticmethod
     def detect_order_blocks(
@@ -195,39 +161,25 @@ class BaseStrategy(ABC):
         lookback: int = 20,
         body_pct: float = 0.60,
         displacement_atr_mult: float = 0.8,
-    ) -> Tuple[pd.Series, pd.Series]:
+    ) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series, pd.Series, pd.Series]:
         """
         Order Block detection via displacement confirmation.
 
-        Bullish OB: last bearish candle immediately before a bullish impulse
-                    (the impulse bar has strong body AND range >= displacement_atr_mult * ATR)
-        Bearish OB: last bullish candle immediately before a bearish impulse
+        CAUSALITY FIX (T1.2): flag is now placed at the DISPLACEMENT bar
+        (i+j), not the OB candle (i).  This is the first bar at which the
+        OB's existence is knowable from past data only.  Entries fire on
+        retest (bars > i+j), so trading semantics are unchanged.
 
-        NOTE: The OB candle is marked AFTER the displacement confirms it — this is
-        intentional. Entries only fire on retest (future bars), so no look-ahead
-        is introduced in actual signal generation.
+        Returns a 6-tuple:
+            (bull_ob, bear_ob, bull_ob_high, bull_ob_low, bear_ob_high, bear_ob_low)
 
-        Returns (bull_ob, bear_ob) boolean Series marking the OB candle.
+        The _high/_low Series carry the OB candle's high/low to the
+        displacement (confirmation) bar; NaN elsewhere.  Consumers .ffill()
+        them to propagate the zone forward.  Causality is preserved.
+
+        See strategies/detectors.py for the full implementation.
         """
-        atr        = df["atr"].ffill()
-        body_ratio = df["body"] / df["range"].replace(0, np.nan)
-
-        # Displacement: strong body + large range
-        strong_bull = df["bullish"]  & (body_ratio >= body_pct) & (df["range"] >= atr * displacement_atr_mult)
-        strong_bear = ~df["bullish"] & (body_ratio >= body_pct) & (df["range"] >= atr * displacement_atr_mult)
-
-        bull_ob = pd.Series(False, index=df.index)
-        bear_ob = pd.Series(False, index=df.index)
-
-        # For each displacement, mark the last opposing candle before it
-        # shift(-j) = "j bars later had a displacement" → mark current bar as OB candidate
-        for j in range(1, min(lookback + 1, len(df))):
-            fwd_strong_bull = strong_bull.shift(-j).fillna(False)
-            fwd_strong_bear = strong_bear.shift(-j).fillna(False)
-            bull_ob |= ~df["bullish"] & fwd_strong_bull
-            bear_ob |= df["bullish"]  & fwd_strong_bear
-
-        return bull_ob, bear_ob
+        return detect_order_blocks(df, lookback, body_pct, displacement_atr_mult)
 
     @staticmethod
     def detect_bos(
@@ -235,41 +187,16 @@ class BaseStrategy(ABC):
         lookback: int = 20,
         confirm_bars: int = 1,
     ) -> Tuple[pd.Series, pd.Series]:
-        """
-        Break of Structure.
-        Bullish BOS: close above the highest high of the previous lookback bars.
-        Bearish BOS: close below the lowest low.
-        """
-        rolling_high = df["high"].rolling(lookback).max().shift(confirm_bars)
-        rolling_low  = df["low"].rolling(lookback).min().shift(confirm_bars)
-        bull_bos = (df["close"] > rolling_high).fillna(False)
-        bear_bos = (df["close"] < rolling_low).fillna(False)
-        return bull_bos, bear_bos
+        """Break of Structure. Causal as-is. See strategies/detectors.py."""
+        return detect_bos(df, lookback, confirm_bars)
 
     @staticmethod
     def detect_choch(
         df: pd.DataFrame,
         lookback: int = 20,
     ) -> Tuple[pd.Series, pd.Series]:
-        """
-        Change of Character: first close through the most recent internal swing.
-
-        Bullish CHoCH: in a downtrend, closes above the last swing high.
-        Bearish CHoCH: in an uptrend, closes below the last swing low.
-        """
-        last_sh = df["swing_high_price"].ffill()
-        last_sl = df["swing_low_price"].ffill()
-
-        bull_choch = (
-            (df["close"] > last_sh.shift(1)) &
-            (df["close"].shift(1) <= last_sh.shift(1))
-        ).fillna(False)
-        bear_choch = (
-            (df["close"] < last_sl.shift(1)) &
-            (df["close"].shift(1) >= last_sl.shift(1))
-        ).fillna(False)
-
-        return bull_choch, bear_choch
+        """Change of Character. Causal as-is. See strategies/detectors.py."""
+        return detect_choch(df, lookback)
 
     # ── Shared filter utilities ───────────────────────────────────────────────
 

@@ -69,12 +69,12 @@ class BreakerBlockReversal(BaseStrategy):
         tol = atr * p["retest_tolerance_atr"]
 
         # ── Step 1: Find Order Blocks ─────────────────────────────────────────
-        bull_ob, bear_ob = self.detect_order_blocks(df, p["ob_lookback"], p["ob_body_pct"])
+        bull_ob, bear_ob, bull_ob_high_raw, bull_ob_low_raw, bear_ob_high_raw, bear_ob_low_raw = self.detect_order_blocks(df, p["ob_lookback"], p["ob_body_pct"])
 
-        bull_ob_high = df["high"].where(bull_ob).ffill()
-        bull_ob_low  = df["low"].where(bull_ob).ffill()
-        bear_ob_high = df["high"].where(bear_ob).ffill()
-        bear_ob_low  = df["low"].where(bear_ob).ffill()
+        bull_ob_high = bull_ob_high_raw.ffill()
+        bull_ob_low  = bull_ob_low_raw.ffill()
+        bear_ob_high = bear_ob_high_raw.ffill()
+        bear_ob_low  = bear_ob_low_raw.ffill()
 
         # ── Step 2: Detect break-through (displacement) ───────────────────────
         # Displacement = bar range >= break_atr_mult * ATR

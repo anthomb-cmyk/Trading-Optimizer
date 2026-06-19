@@ -107,7 +107,7 @@ class DailyBiasIntraday(BaseStrategy):
         fvg_bull_w = self._rolling_any(bull_fvg, 8)
         fvg_bear_w = self._rolling_any(bear_fvg, 8)
 
-        bull_ob, bear_ob = self.detect_order_blocks(df, p["ob_lookback"], p["ob_body_pct"])
+        bull_ob, bear_ob, *_ = self.detect_order_blocks(df, p["ob_lookback"], p["ob_body_pct"])
         ob_bull_w = self._rolling_any(bull_ob, p["ob_lookback"])
         ob_bear_w = self._rolling_any(bear_ob, p["ob_lookback"])
 

@@ -1,9 +1,19 @@
 """
 Multi-timeframe data loader with disk caching and indicator pre-computation.
 
-Fetches OHLCV data directly from Yahoo Finance's V8 chart API (no yfinance package).
-SSL verification is disabled to support corporate-proxy environments.
-Cached as Parquet. Adds ATR, EMA, and swing high/low columns used across all strategies.
+Default data source for futures (MES, MNQ, MGC, ES, NQ, GC) is Databento
+GLBX.MDP3 continuous-contract data.  Yahoo Finance V8 is still available as
+an explicit opt-in (``source="yfinance"``) for quick looks at non-futures
+symbols or when the Databento API key is not available.
+
+The SPY/QQQ/GLD proxy substitution that was previously the default for futures
+has been REMOVED from the default path.  Backtests and optimization now run on
+the actual traded instrument.
+
+SSL verification for Yahoo Finance requests is disabled to support
+corporate-proxy environments.
+Cached as Parquet. Adds ATR, EMA, and swing high/low columns used across all
+strategies.
 """
 import hashlib
 import time
@@ -33,6 +43,7 @@ from config.settings import (
     VOLATILITY,
     WARMUP_BARS,
 )
+import config.run_logger as run_logger
 
 log = get_logger(__name__)
 
@@ -52,15 +63,22 @@ def _is_stale(path: Path) -> bool:
 
 
 # Futures tickers have no direct Yahoo chart history; proxy them to ETFs.
+# Used ONLY when source="yfinance" is explicitly requested.
 # Stooq format equivalents: SPY.US, QQQ.US — kept as reference comments.
 _FUTURES_PROXY_MAP: dict = {
-    "MES=F": "SPY",   # Micro E-mini S&P 500 → SPY (stooq: SPY.US)
-    "ES=F":  "SPY",   # E-mini S&P 500       → SPY (stooq: SPY.US)
-    "MNQ=F": "QQQ",   # Micro E-mini Nasdaq  → QQQ (stooq: QQQ.US)
-    "NQ=F":  "QQQ",   # E-mini Nasdaq        → QQQ (stooq: QQQ.US)
-    "MGC=F": "GLD",   # Micro Gold Futures   → GLD (backtest proxy)
-    "YG=F":  "GLD",   # E-mini Gold Futures  → GLD (backtest proxy)
+    "MES=F": "SPY",   # Micro E-mini S&P 500 -> SPY (stooq: SPY.US)
+    "ES=F":  "SPY",   # E-mini S&P 500       -> SPY (stooq: SPY.US)
+    "MNQ=F": "QQQ",   # Micro E-mini Nasdaq  -> QQQ (stooq: QQQ.US)
+    "NQ=F":  "QQQ",   # E-mini Nasdaq        -> QQQ (stooq: QQQ.US)
+    "MGC=F": "GLD",   # Micro Gold Futures   -> GLD (backtest proxy)
+    "YG=F":  "GLD",   # E-mini Gold Futures  -> GLD (backtest proxy)
 }
+
+# Instruments whose default source is Databento GLBX.MDP3.
+# These are the short instrument keys used in INSTRUMENTS (config/settings.py).
+_DATABENTO_FUTURES_KEYS: frozenset[str] = frozenset({
+    "MES", "ES", "MNQ", "NQ", "MGC", "GC",
+})
 
 # Yahoo Finance V8 interval strings. 3m and 4h are not natively supported;
 # approximate with the nearest available interval.
@@ -241,46 +259,107 @@ def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def load_bars(
-    symbol:      str = "MES",
-    timeframe:   str = "15m",
-    days:        int = LOOKBACK_DAYS,
-    use_cache:   bool = True,
+    symbol:         str = "MES",
+    timeframe:      str = "15m",
+    days:           int = LOOKBACK_DAYS,
+    use_cache:      bool = True,
     add_indicators: bool = True,
+    source:         str | None = None,
+    run_uuid:       str | None = None,
 ) -> pd.DataFrame:
     """
     Load OHLCV bars for *symbol* at *timeframe*.
 
     Returns a DataFrame with DatetimeIndex (UTC), lowercase OHLCV columns,
     and pre-computed indicator columns (ATR, EMAs, swings, etc.).
-    Data is fetched from Yahoo Finance V8 chart API (no yfinance package).
-    Futures tickers (MES=F, MNQ=F) are proxied to SPY/QQQ for history.
+
+    Parameters
+    ----------
+    symbol : str
+        Instrument key from INSTRUMENTS (e.g. ``"MES"``).
+    timeframe : str
+        Bar period (e.g. ``"15m"``, ``"1h"``).
+    days : int
+        Calendar days of history to load.
+    use_cache : bool
+        Reuse on-disk parquet cache when still fresh (CACHE_EXPIRY_HOURS).
+    add_indicators : bool
+        If True, attach ATR, EMA, swing, and candle columns via
+        ``_add_indicators``.  The indicator layer is NOT modified here.
+    source : str or None
+        Data source to use.  Options:
+
+        - ``None`` (default): automatically selects ``"databento"`` for
+          futures instruments (MES, MNQ, MGC, ES, NQ, GC) and
+          ``"yfinance"`` for ETF/equity tickers (SPY, QQQ, GLD, etc.).
+        - ``"databento"``: force Databento GLBX.MDP3 continuous-contract
+          data.  Requires ``DATABENTO_API_KEY`` in environment.
+        - ``"yfinance"``: force Yahoo Finance V8 API.  Futures symbols
+          (MES, ES, etc.) will be substituted for their ETF proxies
+          (SPY/QQQ/GLD) as before.  Use only for quick looks or when
+          Databento is unavailable; this is NOT the default for futures.
+
+    run_uuid : str or None
+        Optional run UUID from ``run_logger.start_run()`` for attaching
+        data-fetch events to a structured run log.
+
+    Notes
+    -----
     The first WARMUP_BARS rows are kept in the returned frame but
-    flagged via `df.attrs['warmup_end_idx']` so strategies can skip them.
+    flagged via ``df.attrs['warmup_end_idx']`` so strategies can skip them.
+
+    ``_add_indicators`` and the swing logic are NOT modified by this
+    function: it only controls which raw OHLCV source is used upstream.
     """
     instrument = INSTRUMENTS.get(symbol)
     if instrument is None:
         raise ValueError(f"Unknown symbol '{symbol}'. Valid: {list(INSTRUMENTS)}")
 
-    ticker          = instrument["ticker"]
-    fallback_ticker = instrument.get("fallback_ticker", "")
-    cache           = _cache_path(ticker, timeframe)
+    # -- Resolve source
+    if source is None:
+        source = "databento" if symbol in _DATABENTO_FUTURES_KEYS else "yfinance"
 
-    if use_cache and not _is_stale(cache):
-        log.debug("Loading %s %s from cache: %s", symbol, timeframe, cache.name)
-        df = pd.read_parquet(cache)
+    # -- Dispatch to Databento or Yahoo
+    if source == "databento":
+        from data.databento_loader import fetch_ohlcv as _db_fetch
+        # Databento loader has its own cache keyed by db_symbol+timeframe.
+        # We bypass the Yahoo-style cache path for this branch.
+        df = _db_fetch(
+            symbol=symbol,
+            timeframe=timeframe,
+            days=days,
+            use_cache=use_cache,
+            run_uuid=run_uuid,
+        )
+    elif source == "yfinance":
+        ticker          = instrument["ticker"]
+        fallback_ticker = instrument.get("fallback_ticker", "")
+        cache           = _cache_path(ticker, timeframe)
+
+        if use_cache and not _is_stale(cache):
+            log.debug("Loading %s %s from yfinance cache: %s", symbol, timeframe, cache.name)
+            df = pd.read_parquet(cache)
+        else:
+            # Note: _fetch_yahoo applies the _FUTURES_PROXY_MAP substitution
+            # (futures -> ETF proxy) for Yahoo.  This is intentional for the
+            # yfinance path and does NOT affect the databento default path.
+            df = _fetch_yahoo(ticker, timeframe, days, fallback_ticker=fallback_ticker)
+            if add_indicators:
+                df = _add_indicators(df)
+            df.to_parquet(cache, engine="pyarrow", compression="snappy")
+            log.info("Cached %s %s -> %s (%d bars, yfinance)", symbol, timeframe, cache.name, len(df))
     else:
-        df = _fetch_yahoo(ticker, timeframe, days, fallback_ticker=fallback_ticker)
-        if add_indicators:
-            df = _add_indicators(df)
-        df.to_parquet(cache, engine="pyarrow", compression="snappy")
-        log.info("Cached %s %s → %s (%d bars)", symbol, timeframe, cache.name, len(df))
+        raise ValueError(
+            f"Unknown source '{source}'. Valid options: 'databento', 'yfinance'."
+        )
 
     if add_indicators and "atr" not in df.columns:
         df = _add_indicators(df)
 
-    df.attrs["symbol"]        = symbol
-    df.attrs["timeframe"]     = timeframe
+    df.attrs["symbol"]         = symbol
+    df.attrs["timeframe"]      = timeframe
     df.attrs["warmup_end_idx"] = WARMUP_BARS
+    df.attrs["source"]         = source
     return df
 
 

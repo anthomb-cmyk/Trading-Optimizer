@@ -17,11 +17,27 @@ Robustness criteria:
 
 Returns a WalkForwardResult with per-fold metrics and an aggregate
 robustness flag used by the optimizer to reject overfitted parameters.
+
+CAUSAL SIGNAL GENERATION
+-------------------------
+Signals are generated *per fold* rather than on the full dataset.  For each
+fold the helper `generate_fold_signals` slices the dataframe as:
+
+    [fold_start - warmup_bars : fold_end]
+
+calls ``generate_signals_fn(slice, params)``, then **strips the warmup prefix
+rows before returning**, so the backtesting engine never scores warmup bars and
+OOS signals are computed only from bars inside their own causal window.
+
+The public ``analyze`` / ``quick_check`` API now accepts a
+``generate_signals_fn`` callable ``(df, params) -> signals_df`` instead of a
+pre-computed ``signals`` frame.  Call sites in ``sunday_optimizer.py`` have
+been updated accordingly.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -29,7 +45,7 @@ import pandas as pd
 from backtesting.engine import BacktestEngine, BacktestResult
 from backtesting.metrics import compute_score
 from config.logger import get_logger
-from config.settings import OPTIMIZER
+from config.settings import OPTIMIZER, WARMUP_BARS
 
 log = get_logger(__name__)
 
@@ -134,6 +150,52 @@ def make_wf_splits(
     return splits
 
 
+# ── Per-fold causal signal generation ────────────────────────────────────────
+
+def generate_fold_signals(
+    df:                   pd.DataFrame,
+    fold_slice:           slice,
+    generate_signals_fn:  Callable[[pd.DataFrame, Dict[str, Any]], pd.DataFrame],
+    params:               Dict[str, Any],
+    warmup_bars:          int = WARMUP_BARS,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Generate signals for a single fold without look-ahead.
+
+    Slices the dataframe as ``[prefix_start : fold_end]`` where
+    ``prefix_start = max(0, fold_start - warmup_bars)``.  Signal generation
+    therefore sees only bars up to ``fold_end`` and can use the warmup prefix
+    for indicator settle-in.
+
+    Returns
+    -------
+    fold_df : pd.DataFrame
+        The raw OHLCV+indicators slice for the fold (warmup rows excluded).
+    fold_signals : pd.DataFrame
+        Signals corresponding to ``fold_df`` (warmup rows excluded).
+
+    The warmup prefix is included during signal computation but stripped from
+    both return values so the backtesting engine scores only real fold rows.
+    """
+    fold_start = fold_slice.start or 0
+    fold_end   = fold_slice.stop  or len(df)
+
+    prefix_start = max(0, fold_start - warmup_bars)
+    n_prefix     = fold_start - prefix_start  # how many warmup rows we prepended
+
+    # Slice with causal warmup prefix
+    ctx_df  = df.iloc[prefix_start:fold_end].copy()
+
+    # Generate signals on the causal context window
+    ctx_sig = generate_signals_fn(ctx_df, params)
+
+    # Strip the warmup prefix from both df and signals
+    fold_df      = ctx_df.iloc[n_prefix:].copy()
+    fold_signals = ctx_sig.iloc[n_prefix:].copy()
+
+    return fold_df, fold_signals
+
+
 # ── Analyzer ─────────────────────────────────────────────────────────────────
 
 class WalkForwardAnalyzer:
@@ -155,14 +217,33 @@ class WalkForwardAnalyzer:
 
     def analyze(
         self,
-        df:       pd.DataFrame,
-        signals:  pd.DataFrame,
-        params:   Dict[str, Any],
+        df:                   pd.DataFrame,
+        generate_signals_fn:  Callable[[pd.DataFrame, Dict[str, Any]], pd.DataFrame],
+        params:               Dict[str, Any],
+        warmup_bars:          int = WARMUP_BARS,
     ) -> WalkForwardResult:
         """
         Run IS+OOS backtest for each fold and return aggregate result.
 
-        signals must already be computed for the full df before calling.
+        Signals are generated *per fold* using ``generate_signals_fn`` so that
+        OOS signals are computed from a causal window ending at the fold
+        boundary.  A warmup prefix (``warmup_bars`` rows taken from the IS
+        side) is prepended to each fold so indicators can settle; those rows
+        are stripped before scoring.
+
+        Parameters
+        ----------
+        df:
+            Full raw dataframe (OHLCV + indicators).
+        generate_signals_fn:
+            Callable ``(df_slice, params) -> signals_df``.  Must be the same
+            function used during the normal backtest (e.g.
+            ``system.generate_signals``).
+        params:
+            Strategy parameter dict for this trial.
+        warmup_bars:
+            Number of bars prepended to each fold as indicator warm-up.
+            Defaults to ``WARMUP_BARS`` from settings.
         """
         splits = make_wf_splits(
             n_bars   = len(df),
@@ -177,10 +258,14 @@ class WalkForwardAnalyzer:
 
         fold_results = []
         for fold_idx, (is_sl, oos_sl) in enumerate(splits):
-            is_df  = df.iloc[is_sl].copy()
-            oos_df = df.iloc[oos_sl].copy()
-            is_sig  = signals.iloc[is_sl].copy()
-            oos_sig = signals.iloc[oos_sl].copy()
+            # Generate IS signals causally (warmup taken from earlier history)
+            is_df, is_sig = generate_fold_signals(
+                df, is_sl, generate_signals_fn, params, warmup_bars,
+            )
+            # Generate OOS signals causally (warmup taken from IS-side bars)
+            oos_df, oos_sig = generate_fold_signals(
+                df, oos_sl, generate_signals_fn, params, warmup_bars,
+            )
 
             # Backtest each period with the same params
             is_result  = self.engine.run(is_df,  is_sig,  params)
@@ -206,17 +291,21 @@ class WalkForwardAnalyzer:
 
     def quick_check(
         self,
-        df:      pd.DataFrame,
-        signals: pd.DataFrame,
-        params:  Dict[str, Any],
-        n_folds: int = 3,
+        df:                   pd.DataFrame,
+        generate_signals_fn:  Callable[[pd.DataFrame, Dict[str, Any]], pd.DataFrame],
+        params:               Dict[str, Any],
+        n_folds:              int = 3,
+        warmup_bars:          int = WARMUP_BARS,
     ) -> float:
         """
         Fast single-value robustness score for use inside Optuna objective.
         Returns avg OOS score across n_folds (fewer folds for speed).
+
+        ``generate_signals_fn`` replaces the old pre-computed ``signals``
+        argument — signals are now generated per fold to avoid look-ahead.
         """
         orig_splits = self.n_splits
         self.n_splits = n_folds
-        result = self.analyze(df, signals, params)
+        result = self.analyze(df, generate_signals_fn, params, warmup_bars)
         self.n_splits = orig_splits
         return result.avg_oos_score

@@ -130,7 +130,7 @@ class FVGRetest(BaseStrategy):
             short_entry_ref = bear_open_top
 
         # ── Step 4: Confluence ────────────────────────────────────────────────
-        bull_ob, bear_ob = self.detect_order_blocks(df, p["ob_lookback"], p["ob_body_pct"])
+        bull_ob, bear_ob, *_ = self.detect_order_blocks(df, p["ob_lookback"], p["ob_body_pct"])
         ob_bull_w = self._rolling_any(bull_ob, age)
         ob_bear_w = self._rolling_any(bear_ob, age)
 

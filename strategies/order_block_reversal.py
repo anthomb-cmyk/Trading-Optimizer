@@ -78,18 +78,18 @@ class OrderBlockReversal(BaseStrategy):
         tol = atr * p["zone_tolerance_atr"]
 
         # ── Step 1: Detect OBs ────────────────────────────────────────────────
-        bull_ob, bear_ob = self.detect_order_blocks(
+        bull_ob, bear_ob, bull_ob_high_raw, bull_ob_low_raw, bear_ob_high_raw, bear_ob_low_raw = self.detect_order_blocks(
             df,
             lookback              = p["ob_lookback"],
             body_pct              = p["ob_body_pct"],
             displacement_atr_mult = p["displacement_atr_mult"],
         )
 
-        # OB zone boundaries — forward-filled from the OB candle
-        bull_ob_high = df["high"].where(bull_ob).ffill()
-        bull_ob_low  = df["low"].where(bull_ob).ffill()
-        bear_ob_high = df["high"].where(bear_ob).ffill()
-        bear_ob_low  = df["low"].where(bear_ob).ffill()
+        # OB zone = the OB candle's high/low, carried causally to the displacement bar.
+        bull_ob_high = bull_ob_high_raw.ffill()
+        bull_ob_low  = bull_ob_low_raw.ffill()
+        bear_ob_high = bear_ob_high_raw.ffill()
+        bear_ob_low  = bear_ob_low_raw.ffill()
 
         # OB midpoint for mitigation check
         bull_ob_mid  = (bull_ob_high + bull_ob_low) / 2

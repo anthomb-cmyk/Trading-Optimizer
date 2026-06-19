@@ -125,8 +125,12 @@ class _Objective:
             raise optuna.TrialPruned()
 
         # ── Walk-forward validation on top candidates ─────────────────────────
+        # Pass the generate_signals callable so walk-forward generates signals
+        # per fold (causal), avoiding look-ahead from full-dataset pre-computation.
         if self.use_wf and adj_score > 0.35:
-            wf_score = self.wf.quick_check(self.df, signals, params, self.wf_folds)
+            wf_score = self.wf.quick_check(
+                self.df, self.system.generate_signals, params, self.wf_folds,
+            )
             final_score = 0.40 * adj_score + 0.60 * wf_score
         else:
             final_score = adj_score
@@ -219,22 +223,27 @@ class SundayOptimizer:
                  len(best_params),
                  "full_params" if "full_params" in best.user_attrs else "best.params fallback")
 
-        # Run full 5-fold WF on the best parameters
+        # Run full 5-fold WF on the best parameters.
+        # Pass the generate_signals callable so each fold is evaluated causally.
         log.info("Running full walk-forward validation on best params...")
-        signals = self.objective.system.generate_signals(
-            self.objective.df, best_params
-        )
-
         from backtesting.walk_forward import WalkForwardAnalyzer
         wf_full = WalkForwardAnalyzer(
             self.objective.engine,
             n_splits = OPTIMIZER["walk_forward_splits"],
         )
-        wf_result = wf_full.analyze(self.objective.df, signals, best_params)
+        wf_result = wf_full.analyze(
+            self.objective.df,
+            self.objective.system.generate_signals,
+            best_params,
+        )
         log.info("Full WF result: %s", wf_result.summary())
 
-        # Final backtest on full data — recompute score with the same
-        # min_trades threshold used during optimization for consistency.
+        # Final backtest on full data (summary evaluation only — not fold-based).
+        # Signals are generated on the full dataset here intentionally; this is a
+        # diagnostic pass to show overall performance, not a causal OOS check.
+        signals = self.objective.system.generate_signals(
+            self.objective.df, best_params
+        )
         full_result = self.objective.engine.run(
             self.objective.df, signals, best_params
         )

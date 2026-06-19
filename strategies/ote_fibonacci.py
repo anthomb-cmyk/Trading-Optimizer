@@ -134,7 +134,7 @@ class OTEFibonacciEntry(BaseStrategy):
         rev_bull = df["bullish"] & (body_pct >= p["reversal_body_pct"])   # bullish engulf/hammer
         rev_bear = ~df["bullish"] & (body_pct >= p["reversal_body_pct"])  # bearish
 
-        bull_ob, bear_ob = self.detect_order_blocks(df, p["ob_lookback"], p["ob_body_pct"])
+        bull_ob, bear_ob, *_ = self.detect_order_blocks(df, p["ob_lookback"], p["ob_body_pct"])
         bull_ob_w = self._rolling_any(bull_ob, 8)
         bear_ob_w = self._rolling_any(bear_ob, 8)
 
