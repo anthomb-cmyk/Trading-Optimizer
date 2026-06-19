@@ -104,3 +104,17 @@ Caveats: single in-sample period, no DSR/PBO/holdout; Sharpe magnitudes inflated
 
 ### Next: Phase 2 wave 2
 Run the optimizer (data-derived trial budget + locked 20% holdout + DSR/PBO, logged to Supabase) on the promising strategies (fvg_retest, kill_zone, asian_session) to see whether any edge survives out-of-sample after overfitting correction.
+
+## 2026-06-19 - Phase 2 wave 2: honest optimizer run (THE VERDICT)
+Ran the optimizer on MES 15m (200 trials, 8 completed / 192 pruned, locked 20% holdout, data-derived budget). Result:
+- Train: PF 1.22, Sharpe 0.60, 20 trades, +$801, best_score 0.34.
+- LOCKED HOLDOUT: score 0.0 (no edge out-of-sample).
+- Walk-forward: is_robust=FALSE, pass_rate 0%, avg_degradation 100%.
+- Optimizer drove `system_min_conf` to 0 (stripped the confluence gate) - as the audit warned.
+
+VERDICT: the APEX/ICT system has NO validated edge. The honest engine did its job: an in-sample fit that collapses out-of-sample. Matches the research (ICT has no demonstrated edge). This is now a measured result on real MES data.
+
+BUG (guardrails miscalibrated): best_params.json showed deflated_sharpe=1.0 and pbo=0.0, which CONTRADICT the holdout/walk-forward verdict. Cause: DSR computed with the annualized Sharpe x large n_obs (units mismatch -> inflates to 1.0); PBO estimated from tiled trial scores, not a real per-period return matrix. Trustworthy signals are holdout_score + walk_forward.is_robust. Fix DSR/PBO wiring so the guardrails stop giving false confidence.
+
+## DECISION POINT - Phase 3 fork
+ICT did not survive honest validation (as predicted). Options: (A) pivot the strategy layer to evidence-based edges (ORB+volume, VWAP reversion, overnight gap fade, short-term reversal) behind a VIX/ADX regime filter, with an optional LLM sentiment overlay; (B) keep iterating ICT params/timeframes; (C) pause. Recommend A. Awaiting Anthony's call.
